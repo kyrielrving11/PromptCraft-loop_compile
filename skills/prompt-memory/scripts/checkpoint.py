@@ -32,6 +32,7 @@ _REQUIRED_KEYS = {"task_id", "user_intent"}
 _OPTIONAL_KEYS = {
     "skill_used", "stage", "hard_constraints", "key_decisions",
     "generated_prompt", "execution_feedback", "tags", "summary",
+    "task_type", "quality_score", "overlay_used",
 }
 
 DEFAULT_VAULT = Path(".promptcraft/prompt_vault.json")
@@ -39,6 +40,7 @@ DEFAULT_PROMPTS_DIR = Path(".promptcraft/prompts")
 GLOBAL_VAULT = Path.home() / ".promptcraft" / "global_vault.json"
 GLOBAL_PROMPTS_DIR = Path.home() / ".promptcraft" / "prompts"
 MAX_PREVIEW_CHARS = 200
+MAX_ENTRY_TEXT_LENGTH = 8192  # Hard cap per entry (8 KB) — cf. execution boundary Layer 3
 
 
 def _utc_now() -> str:
@@ -122,6 +124,13 @@ def _build_entry(payload: dict, vault: dict, prompts_dir: Path, version_of: str 
     full_prompt = str(payload.get("generated_prompt", "")).strip()
     task_id = str(payload["task_id"]).strip()
 
+    # ── Layer 3: Entry size guard ──
+    if len(full_prompt) > MAX_ENTRY_TEXT_LENGTH:
+        raise ValueError(
+            f"Entry text too large: {len(full_prompt)} bytes exceeds max {MAX_ENTRY_TEXT_LENGTH}. "
+            "Truncate or split across multiple entries."
+        )
+
     # ── Validate version_of matches task_id ──
     if version_of and version_of != task_id:
         raise ValueError(
@@ -154,6 +163,9 @@ def _build_entry(payload: dict, vault: dict, prompts_dir: Path, version_of: str 
         "generated_prompt_preview": _truncate(full_prompt) if full_prompt else "",
         "execution_feedback": str(payload.get("execution_feedback", "")).strip(),
         "tags": _list_field(payload, "tags"),
+        "task_type": str(payload.get("task_type", "")).strip(),
+        "quality_score": int(payload.get("quality_score", 0)) or 0,
+        "overlay_used": _list_field(payload, "overlay_used"),
     }
 
     # Store LLM-generated summary if present

@@ -2,171 +2,187 @@
 
 [中文文档](README.zh-CN.md)
 
-PromptCraft is a suite of **prompt engineering Skills** for AI coding agents
-(CodeBuddy / Codex / Claude Code). The core philosophy: before asking a model to
-"think harder", first polish the task brief you hand it.
+PromptCraft is a **prompt-engineering sub-agent** for AI coding agents
+(Claude Code / Codex / CodeBuddy). It manages the full lifecycle of prompts
+and skills: generation, personalisation, execution feedback, pattern analysis,
+and evolution suggestions — backed by a persistent vault that improves across
+sessions and projects.
 
-> **Task Enhancement** — improving the quality of the input before the model
-> starts reasoning. And then **remembering** what worked, what didn't, and what
-> constraints were discovered — across sessions and across projects.
-
----
-
-## Key Innovations
-
-| Innovation | Description |
-|---|---|
-| **LLM-as-a-Router** | Zero-code routing. The host model evaluates *independence × cognitive load* and selects the best technique from a catalog of 7. No external API calls. |
-| **Workspace-Anchored Memory** | Prompt history lives in human-readable JSON + Markdown files. The host tool's file system provides indexing, portability, and git-diff. No database, no proprietary APIs. |
-| **Git-Style Version Control** | Every revision is appended, never overwritten. An `is_active` pointer marks the current version. `hydrate.py --rollback-to v1` switches back instantly. |
-| **Multi-Project Federation** | A two-tier vault: `~/.promptcraft/global_vault.json` for cross-project constraints, `.promptcraft/prompt_vault.json` for project-specific history. hydrate.py merges both automatically. |
-| **Query Expansion** | Before searching the vault, the LLM generates cross-language keyword expansions (e.g. Chinese → English synonyms). Overcomes Jaccard's synonym blindness without external dependencies. |
-| **Execution Feedback Loop** | After prompt-craft executes a prompt, it analyzes the output against hard constraints and writes structured feedback back to the vault. Future sessions learn from past results. |
+> **v2.5** — Sub-agent architecture with 6 modes, 5-layer execution boundary,
+> dual-storage vault, batch processing, proactive signals, vault-hydrate
+> preflight gating, and 181 tests. Python stdlib only.
 
 ---
+
+## Architecture
+
+```
+Main Agent (Claude Code / Codex)
+  │
+  ├─ promptcraft-bridge (trigger Skill)  ← when_to_use + vault hydrate preflight
+  │     └─ delegates to PromptCraft sub-agent when warranted
+  │
+  └─ PromptCraft Sub-Agent (isolated context)
+        │
+        ├─ subagent_adapter.py   ← unified entry, 6-mode routing
+        ├─ engine.py             ← lifecycle manager + circuit breaker
+        ├─ boundary.py           ← 5-layer defence-in-depth
+        ├─ circuit_breaker.py    ← denial tracking, 3-state machine
+        └─ tools/                ← 5 specialised engines
+              personalization / prompt_build / feedback_collect
+              / pattern_analysis / skill_advisor
+```
+
+## Six Modes
+
+| Mode | Trigger | Returns |
+|------|---------|---------|
+| **overlay** | Matching Skill + vault history | Domain-filtered constraints for Skill enhancement |
+| **build** | No Skill + high-risk task, or vault baseline needed | Full 8-section structured prompt |
+| **feedback** | After execution | Quality score + improvement notes |
+| **analyze** | Health report signals `->analyze` | Pattern report from accumulated data |
+| **advise** | Health report signals `->advise` | Skill evolution/creation suggestions |
+| **batch** | Multiple tasks | BatchSummary + per-item results |
+
+**Triggering model**: `when_to_use` (LLM semantic gating) → cheap vault hydrate
+(`hydrate.py --query <task> --top 3`) → if relevant history or high-risk keywords
+→ invoke overlay/build. Otherwise skip PromptCraft. No assess sub-agent round-trip.
+
+Every response includes a compact **Health Report**: `[PC: 15 records, normal]`
+and `proactive_signals` — vault context hints (similar tasks, common pitfalls).
+
+## Quick Start
+
+```bash
+# 0. Cheap preflight — check vault for relevant history (no LLM cost)
+python skills/prompt-memory/scripts/hydrate.py --query "audit security" --top 3
+
+# 1. Build a prompt (no matching Skill, or high-risk task)
+echo '{"task":"audit ERC20 token","mode":"build"}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# 2. Personalise a Skill (matching Skill + vault history found)
+echo '{"task":"audit contract","mode":"overlay","skill_name":"solidity-audit"}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# 3. Record execution feedback
+echo '{"task":"audit contract","mode":"feedback","feedback":{"output":"...","success":true}}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# 4. Batch-process multiple tasks
+echo '{"mode":"batch","items":[{"task":"audit token","skill_name":"solidity-audit"},{"task":"write docs"}]}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# Vault I/O (standalone)
+echo '{"task_id":"org-standard","user_intent":"all contracts must pass Certora"}' \
+  | python skills/prompt-memory/scripts/checkpoint.py --global
+
+python skills/prompt-memory/scripts/hydrate.py --query "audit security"
+```
+
+## Execution Boundary (5-Layer Defence-in-Depth)
+
+Adapted from Claude Code's 7-layer permission system for a sub-agent whose
+threat model is **knowledge pollution**, not shell injection.
+
+| Layer | Guards | Hard-Deny Triggers |
+|-------|--------|-------------------|
+| 1 — Input | Injection detection, mode consistency | System-override patterns, mode-protocol mismatch |
+| 2 — Tool | Per-tool safety attributes + `check_permissions()` | **MODIFIES_SKILLS** (bypass-immune) |
+| 3 — Vault | Size cap (8KB), rate limit (50/session), dedup, GLOBAL quality ≥4 | Exceeding caps, GLOBAL with low quality |
+| 4 — Output | Schema enforcement, sensitive-data scan, size cap | Schema violation, payload overflow |
+| 5 — Breaker | Denial tracking, 3-state machine | 3 consecutive denials → OPEN (5 min cooldown) |
+
+**Key rule:** `MODIFIES_SKILLS = False` for all tools. Skill modification is
+bypass-immune — PromptCraft only suggests, the main agent executes.
 
 ## Project Structure
 
 ```
 PromptCraft/
+├── promptcraft-agent/
+│   ├── subagent_adapter.py    # Unified entry point, 6-mode routing
+│   ├── engine.py              # Lifecycle manager, 5 invoke_* methods
+│   ├── builder.py             # Single-build pipeline (8-section prompt)
+│   ├── protocol.py            # I/O schemas, 6 Mode values
+│   ├── health_report.py       # HealthReport + threshold gating
+│   ├── context.py             # EngineContext — 3-layer state container
+│   ├── boundary.py            # 5-layer execution boundary guards
+│   ├── circuit_breaker.py     # 3-state circuit breaker
+│   ├── loop.py                # CLI entry point
+│   ├── system_prompt.md       # 7-layer progressive system prompt
+│   ├── AGENT.md               # Claude Code sub-agent definition
+│   └── tools/                 # Five-engine tool system
+│       ├── base.py            # Tool base + safety attributes
+│       ├── personalization.py # Skill overlay injection
+│       ├── prompt_build.py    # Full prompt generation (fallback)
+│       ├── feedback_collect.py # Explicit + implicit feedback
+│       ├── pattern_analysis.py # Aggregate pattern discovery
+│       └── skill_advisor.py   # Evolution/creation suggestions
 ├── skills/
-│   ├── prompt-craft/          # Core workflow: route → build → save → execute
-│   │   ├── SKILL.md           #   6-step workflow + LLM router + query expansion + feedback loop
-│   │   └── references/        #   routing matrix + build checklist
-│   ├── prompt-memory/         # Workspace-anchored memory I/O + federation
-│   │   ├── SKILL.md
+│   ├── prompt-memory/         # Dual-storage vault I/O + federation
 │   │   ├── scripts/           #   checkpoint.py + hydrate.py
-│   │   └── references/        #   vault schema (incl. federation & feedback sub-schemas)
-│   ├── prompt-techniques/     # Catalog of 7 prompt-engineering techniques
-│   │   ├── SKILL.md
-│   │   └── references/        #   zero-shot, few-shot, cot, step-back, least-to-most, tot
-│   └── prompt-review/         # Prompt quality audit with technique-specific guidance
-│       ├── SKILL.md
-│       └── references/        #   review checklist
+│   │   └── references/        #   vault schema
+│   ├── prompt-techniques/     # Catalog of 7 techniques
+│   │   └── references/        #   zero-shot through tree-of-thought
+│   └── promptcraft-bridge/    # Trigger-only Skill → sub-agent delegation
+│       └── references/        #   when-to-invoke heuristics
 ├── tests/
-│   └── test_scripts.py        # 42 unit tests (checkpoint + hydrate + federation)
-├── CLAUDE.md                  # Project conventions for Claude Code
-├── .promptcraft/              # Runtime storage (created on first use)
-│   ├── prompt_vault.json      #   lightweight metadata index (~200 tokens/entry)
-│   └── prompts/               #   complete prompt archive (.md files)
-├── LICENSE
+│   ├── test_scripts.py        # 48 tests (checkpoint, hydrate, federation)
+│   ├── test_health_report.py  # 31 tests (thresholds, stall, consistency, proactive)
+│   ├── test_subagent_adapter.py # 16 tests (routing, parsing, batch, E2E)
+│   ├── test_engine_modes.py   # 19 tests (5 invoke_* + silent analyze + batch)
+│   ├── test_integration.py    # 10 tests (full closed-loop workflows)
+│   └── test_boundary.py       # 57 tests (5-layer guards, breaker, tools, batch input)
+├── .claude/agents/            # Sub-agent registration
+├── CLAUDE.md                  # Project conventions
 └── README.md / README.zh-CN.md
 ```
 
-Global vault (cross-project): `~/.promptcraft/global_vault.json`
+## Key Features
 
----
-
-## The 4 Skills
-
-| Skill | Role | When to use |
-|---|---|---|
-| `prompt-craft` | Core entry: query expansion → vault hydration → LLM routing → technique selection → conditional case generation → prompt build → vault save → execute + feedback write-back | You need to write or improve a high-quality prompt |
-| `prompt-memory` | Dual-storage I/O with federation: `checkpoint.py` (save, `--global` for cross-project), `hydrate.py` (search with auto-merge of global + project vaults, `--no-global` to opt out) | Persist / load / version prompt history |
-| `prompt-techniques` | Reference catalog of 7 techniques with JSON input templates, design rules, case generation rules, search strategies, and output templates | Loaded on-demand by other skills |
-| `prompt-review` | Quality gate with technique-specific checks: completeness → constraints → technique fit → context quality → anti-patterns → edge cases. Severity-tagged findings (BLOCKER/MAJOR/MINOR) | Audit an existing prompt |
-
----
-
-## The Pipeline 
-
-Loading `prompt-craft` triggers an automatic pipeline:
-
-```
-Step 0a: Query Expansion → LLM generates cross-language keywords to improve
-         Jaccard overlap with vault entries (zero-code, zero-API)
-Step 0b: hydrate.py → auto-merges global + project vaults;
-         GLOBAL entries (both vaults) unconditionally injected into context;
-         top-k relevant entries by Jaccard score
-Step 1: LLM Router → independence × cognitive load → select technique
-Step 2: Read technique details → load method_steps + design_rules from references/
-Step 2.5: Conditional Case Generation → only when user provides domain knowledge
-Step 3: Build enhanced prompt → 8-section structure with approved cases
-Step 4: checkpoint.py → save to project vault (or --global for cross-project)
-Step 5: Action selection
-        ├── 🚀 Execute now   → execute → analyze output → feedback written back
-        │                      to vault (structured: status + quality_score + violations)
-        ├── 💾 Save for later → persist; hydrate.py --full loads it later
-        └── 🔍 Review & improve → load prompt-review, new version auto-appended
-```
-
----
-
-## Multi-Project Federation
-
-PromptCraft supports a two-tier vault:
-
-| Tier | Path | Use case |
-|------|------|----------|
-| **Global** | `~/.promptcraft/global_vault.json` | Org-wide standards ("all SQL must have rollback scripts"), shared templates |
-| **Project** | `.promptcraft/prompt_vault.json` | Project-specific decisions, bug-specific prompts |
-
-**hydrate.py** automatically merges both vaults on every query. Project entries
-take precedence when the same `task_id` exists in both. Use `--no-global` to
-search only the project vault.
-
-**checkpoint.py** saves to the project vault by default. Use `--global` to
-save to the global vault instead.
-
-```bash
-# Save org-wide constraint
-echo '{"task_id":"org-security","user_intent":"All contracts must pass Certora"}' | \
-  python checkpoint.py --global
-
-# Search (auto-merges both vaults)
-python hydrate.py --query "audit contract security"
-
-# Project-only search
-python hydrate.py --query "audit contract" --no-global
-```
-
----
-
-## Install & Use
-
-Copy the 4 Skill directories from `skills/` into your project or user
-Skills directory (e.g. `.codex/skills/` for CodeBuddy):
-
-```
-your-project/.codex/skills/prompt-craft/
-your-project/.codex/skills/prompt-memory/
-your-project/.codex/skills/prompt-techniques/
-your-project/.codex/skills/prompt-review/
-```
-
-The scripts default to `.promptcraft/` as the vault root and
-`.codex/skills/prompt-memory/scripts/` as the scripts path. Override via
-`--vault` / `--prompts-dir` flags.
-
-Then, in a CodeBuddy / Codex / Claude Code chat:
-
-> Load prompt-craft. Help me write a high-quality prompt.
-
-The AI automatically runs the full pipeline.
-
----
+- **Sub-Agent Architecture**: Isolated context, vault-backed persistence,
+  cross-session improvement — wakes via trigger Skill with vault-hydrate preflight
+- **Batch Processing**: Process multiple tasks in one call — hydrate once,
+  group by Skill match, execute in parallel (max 4 workers)
+- **Proactive Signals**: Every response includes vault-aware context hints
+  (similar tasks, common pitfalls) without changing the passive-trigger model
+- **5-Layer Execution Boundary**: Defence-in-depth adapted from Claude Code
+  for a sub-agent's actual threat model (knowledge pollution, not shell injection)
+- **Circuit Breaker**: 3-state machine (CLOSED → OPEN → HALF_OPEN) with
+  denial tracking and automatic cooldown
+- **Multi-Project Federation**: Two-tier vault — global (`~/.promptcraft/`)
+  + project (`./.promptcraft/`)
+- **Query Expansion**: LLM-generated cross-language keywords before Jaccard
+  search (zero-code)
+- **Execution Feedback Loop**: Structured quality scoring (1-5) written back
+  to vault after every execution
+- **Health Report**: Compact one-line signal — `[PC: N records, action=...]` —
+  tells the main agent when to run analysis or advice
+- **Skill-Advisor**: Data-backed evolution/creation suggestions — never
+  auto-modifies Skills
+- **Append-only Vault**: Full version history, rollback support, dual storage
+  (JSON index + Markdown prompts)
+- **Multi-Script Tokenizer**: CJK + Japanese Kana + Korean Hangul + Latin + Cyrillic
 
 ## Tech Stack
 
-- **Python stdlib only**: zero external dependencies
-- **Dual storage**: JSON vault = lightweight index; `.md` files = complete prompts
-- **Two-tier federation**: global vault (`~/`) + project vault (`./`)
-- **Zero-code routing**: LLM-as-a-Router embedded in SKILL.md
-- **Query expansion**: LLM-generated cross-language keywords (no embeddings, no APIs)
-- **Semantic search**: Jaccard similarity on multi-script tokens (CJK + Latin + Cyrillic)
-- **Context economics**: compact mode ~200 tokens; `--full` reads `.md` files on demand
-- **Feedback loop**: structured execution feedback written back to vault
+- **Python stdlib only** — no pip install, no venv
+- **Dual storage** — JSON vault (metadata) + `.md` files (full prompts)
+- **Two-tier federation** — global vault + project vault, auto-merged
+- **Sub-agent model** — isolated context, trigger-based wake-up
+- **Jaccard similarity** — multi-script tokenizer, zero external deps
+- **Zero external API calls** — no embedding services, no proprietary APIs
 
 ## Design Principles
 
-- Enhance input quality — never replace the model's reasoning
-- Zero external model calls — no API costs, no embedding services
-- No proprietary memory APIs — plain filesystem, human-readable JSON/Markdown
-- No closed databases — the vault is editable, diffable, version-controllable
-- Append, never overwrite — full version history preserved
-- Dual storage: JSON for fast metadata search, `.md` for complete prompt readability
-- Federation: global vault for cross-project constraints, project vault for local decisions
-- Rich technique references — design rules, JSON templates, case generation rules
+- **Enhance, don't replace** — Skills own the workflow, PromptCraft provides overlay
+- **Fail-closed** — guards deny when uncertain; MODIFIES_SKILLS is bypass-immune
+- **Health Report only** — internal vault state is never exposed to the main agent
+- **Never auto-modify Skills** — suggestions only, execution is the main agent's job
+- **importance = blast radius** — GLOBAL affects all projects, escalation requires data
+- **Append, never overwrite** — full version history preserved
+- **Zero external dependencies** — plain filesystem, human-readable JSON/Markdown
 
 ## License
 

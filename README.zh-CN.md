@@ -2,166 +2,174 @@
 
 [English README](README.md)
 
-PromptCraft 是一套面向 AI 编程助手（CodeBuddy / Codex / Claude Code）的
-**提示工程 Skills 套件**。核心理念：在让模型"更努力思考"之前，先把交给
-模型的任务说明整理好。然后**记住**什么有效、什么失败、发现了什么约束——
-跨会话、跨项目地积累。
+PromptCraft 是一个面向 AI 编程助手的**提示工程子Agent**
+（Claude Code / Codex / CodeBuddy）。它管理提示词和技能的全生命周期：
+生成、个性化、执行反馈、模式分析和进化建议——由持久化 vault 支撑，
+跨会话、跨项目持续改进。
 
-> **任务增强** — 提升输入质量，然后持久化推理决策。
-
----
-
-## 核心创新
-
-| 创新 | 说明 |
-|------|------|
-| **LLM-as-a-Router** | 零代码路由——宿主模型根据*独立性 × 认知复杂度*从 7 种技巧中自行选择最佳方案。无外部 API 调用。 |
-| **工作区锚定记忆** | 提示词历史写入人类可读的 JSON + Markdown 文件，利用宿主文件系统实现索引、可移植性和 git diff。无数据库，无私有 API。 |
-| **Git 式版本控制** | 同一任务多次改进追加不覆盖，`is_active` 指针标记活跃版本，`hydrate.py --rollback-to v1` 一键回退。 |
-| **多项目联邦** | 双层 vault：`~/.promptcraft/global_vault.json` 存跨项目约束，`.promptcraft/prompt_vault.json` 存项目特定历史。hydrate.py 自动合并检索。 |
-| **查询扩展** | 检索前由 LLM 生成跨语言关键词扩展（如中文→英文同义词），突破 Jaccard 对同义词的盲区。零外部依赖。 |
-| **执行反馈闭环** | prompt-craft 执行 prompt 后自动对照硬约束分析输出质量，结构化反馈写回 vault。未来会话从历史结果中学习。 |
+> **v2.5** — 子Agent架构：6种模式、5层执行边界、双存储vault、批处理、
+> 主动信号、vault-hydrate预检门控、181个测试。Python 标准库，零外部依赖。
 
 ---
+
+## 架构
+
+```
+主Agent (Claude Code / Codex)
+  │
+  ├─ promptcraft-bridge (触发器Skill)  ← when_to_use + vault hydrate 预检
+  │     └─ 按需委托给 PromptCraft 子Agent
+  │
+  └─ PromptCraft 子Agent (隔离上下文)
+        │
+        ├─ subagent_adapter.py   ← 统一入口，6模式路由
+        ├─ engine.py             ← 生命周期管理 + 熔断器、批处理
+        ├─ boundary.py           ← 5层纵深防御
+        ├─ circuit_breaker.py    ← 拒绝追踪，3态状态机
+        └─ tools/                ← 5个专用引擎
+              personalization / prompt_build / feedback_collect
+              / pattern_analysis / skill_advisor
+```
+
+## 六种模式
+
+| 模式 | 触发条件 | 返回内容 |
+|------|---------|---------|
+| **overlay** | 匹配Skill + vault有相关历史 | 领域过滤后的约束叠加 |
+| **build** | 无Skill + 高风险任务，或需建立vault基线 | 完整8节结构化提示词 |
+| **feedback** | 执行完成后 | 质量评分 + 改进建议 |
+| **analyze** | Health Report 信号 `->analyze` | 累积数据的模式报告 |
+| **advise** | Health Report 信号 `->advise` | Skill进化/创建建议 |
+| **batch** | 批量任务 | BatchSummary + 逐项结果 |
+
+**触发模型**：`when_to_use`（LLM语义判断）→ 低成本 vault hydrate
+(`hydrate.py --query <task> --top 3`) → 有相关历史或高风险关键词
+→ 调用 overlay/build。否则跳过 PromptCraft。无 assess 子Agent往返。
+
+每次响应附紧凑 **Health Report**：`[PC: 15 records, normal]`
+以及 `proactive_signals`——vault 上下文提示（类似任务、常见陷阱）。
+
+## 快速开始
+
+```bash
+# 0. 低成本预检 — 查vault是否有相关历史（零LLM开销）
+python skills/prompt-memory/scripts/hydrate.py --query "审计 合约 安全" --top 3
+
+# 1. 生成提示词（无匹配Skill，或高风险任务）
+echo '{"task":"审计ERC20代币合约","mode":"build"}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# 2. 个性化已有Skill（匹配Skill + vault有历史）
+echo '{"task":"审计合约","mode":"overlay","skill_name":"solidity-audit"}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# 3. 记录执行反馈
+echo '{"task":"审计合约","mode":"feedback","feedback":{"output":"...","success":true}}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# 4. 批量处理多任务
+echo '{"mode":"batch","items":[{"task":"审计代币","skill_name":"solidity-audit"},{"task":"写文档"}]}' \
+  | python promptcraft-agent/subagent_adapter.py
+
+# Vault I/O (独立使用)
+echo '{"task_id":"org-security","user_intent":"所有合约必须通过Certora验证"}' \
+  | python skills/prompt-memory/scripts/checkpoint.py --global
+
+python skills/prompt-memory/scripts/hydrate.py --query "审计 合约 安全"
+```
+
+## 执行边界（5层纵深防御）
+
+借鉴 Claude Code 的7层权限系统，为子Agent的真实威胁模型
+（**知识污染**而非Shell注入）重新设计：
+
+| 层 | 防护对象 | 硬拒绝触发条件 |
+|----|---------|--------------|
+| 1 — 输入 | 注入检测、模式一致性 | 系统指令覆盖、模式-协议不匹配 |
+| 2 — 工具 | 每工具安全属性 + `check_permissions()` | **MODIFIES_SKILLS**（bypass-immune，永不可绕过） |
+| 3 — Vault | 大小上限(8KB)、速率限制(50/会话)、去重、GLOBAL质量≥4 | 超上限、低质量GLOBAL写入 |
+| 4 — 输出 | Schema强制、敏感信息扫描、大小限制 | Schema违规、载荷溢出 |
+| 5 — 熔断 | 拒绝追踪、3态状态机 | 连续3次拒绝→OPEN(冷却5分钟) |
+
+**核心规则：** 所有工具 `MODIFIES_SKILLS = False`。Skill修改是bypass-immune硬拒绝——
+PromptCraft只建议，主Agent执行。
 
 ## 项目结构
 
 ```
 PromptCraft/
+├── promptcraft-agent/
+│   ├── subagent_adapter.py    # 统一入口，6模式路由
+│   ├── engine.py              # 生命周期管理，5个invoke_*方法
+│   ├── builder.py             # 单次构建管线（8节提示词）
+│   ├── protocol.py            # I/O schema，6个Mode值
+│   ├── health_report.py       # HealthReport + 阈值门控
+│   ├── context.py             # EngineContext — 3层状态容器
+│   ├── boundary.py            # 5层执行边界守卫
+│   ├── circuit_breaker.py     # 3态熔断器
+│   ├── loop.py                # CLI入口
+│   ├── system_prompt.md       # 7层渐进式系统提示词
+│   ├── AGENT.md               # Claude Code子Agent定义
+│   └── tools/                 # 五引擎工具系统
+│       ├── base.py            # 工具基类 + 安全属性
+│       ├── personalization.py # Skill叠加注入
+│       ├── prompt_build.py    # 完整提示词生成(兜底)
+│       ├── feedback_collect.py # 显式+隐式反馈
+│       ├── pattern_analysis.py # 聚合模式发现
+│       └── skill_advisor.py   # 进化/创建建议
 ├── skills/
-│   ├── prompt-craft/          # 核心工作流：路由→构建→保存→执行+反馈
-│   │   ├── SKILL.md           #   6步工作流 + LLM路由 + 查询扩展 + 反馈闭环
-│   │   └── references/        #   路由决策表 + 构建检查清单
-│   ├── prompt-memory/         # 工作区锚定记忆 + 联邦
-│   │   ├── SKILL.md
+│   ├── prompt-memory/         # 双存储vault I/O + 联邦
 │   │   ├── scripts/           #   checkpoint.py + hydrate.py
-│   │   └── references/        #   vault schema（含联邦与反馈子模式）
+│   │   └── references/        #   vault schema
 │   ├── prompt-techniques/     # 7种技巧参考目录
-│   │   ├── SKILL.md
-│   │   └── references/        #   zero-shot, few-shot, cot, step-back, least-to-most, tot
-│   └── prompt-review/         # 提示词质量审查（含技巧特定检查）
-│       ├── SKILL.md
-│       └── references/        #   审查检查清单
+│   │   └── references/        #   zero-shot 到 tree-of-thought
+│   └── promptcraft-bridge/    # 纯触发器Skill → 子Agent委托
+│       └── references/        #   启发式触发指南
 ├── tests/
-│   └── test_scripts.py        # 42 个单元测试（checkpoint + hydrate + federation）
-├── CLAUDE.md                  # Claude Code 项目约定
-├── .promptcraft/              # 运行时存储（首次使用自动创建）
-│   ├── prompt_vault.json      #   轻量元数据索引（～200 token/条）
-│   └── prompts/               #   完整 Prompt 存档（.md 文件）
-├── LICENSE
+│   ├── test_scripts.py        # 48 tests (checkpoint, hydrate, federation)
+│   ├── test_health_report.py  # 31 tests (阈值, stall, consistency, proactive)
+│   ├── test_subagent_adapter.py # 16 tests (路由, 解析, batch, E2E)
+│   ├── test_engine_modes.py   # 19 tests (5 invoke_* + silent + batch)
+│   ├── test_integration.py    # 10 tests (完整闭环工作流)
+│   └── test_boundary.py       # 57 tests (5层守卫, 熔断器, 工具, batch输入)
+├── .claude/agents/            # 子Agent注册
+├── CLAUDE.md                  # 项目约定
 └── README.md / README.zh-CN.md
 ```
 
-全局 vault（跨项目）：`~/.promptcraft/global_vault.json`
+## 核心特性
 
----
-
-## 4 个 Skill
-
-| Skill | 职责 | 使用场景 |
-|-------|------|---------|
-| `prompt-craft` | 核心入口：查询扩展 → vault 加载 → LLM 路由 → 技巧选择 → 条件案例生成 → 构建 Prompt → 保存 → 执行+反馈写回 | 需要写或改进高质量提示词 |
-| `prompt-memory` | 双存储 I/O + 联邦：`checkpoint.py`（保存，`--global` 写全局 vault），`hydrate.py`（自动合并全局+项目 vault，`--no-global` 跳过全局） | 保存/加载/版本管理提示词历史 |
-| `prompt-techniques` | 7 种技巧参考目录，含 JSON 输入模板、设计规则、案例生成规则、搜索策略和输出模板 | 被其他 Skill 按需引用 |
-| `prompt-review` | 质量门 + 技巧特定检查：完整性→约束→技巧匹配→上下文质量→反模式→边界情况。严重性标记（BLOCKER/MAJOR/MINOR） | 审查已有提示词 |
-
----
-
-## 工作流
-
-加载 `prompt-craft` 后自动执行：
-
-```
-Step 0a: 查询扩展 → LLM 生成跨语言关键词，提升 Jaccard 与 vault 的重叠度
-         （零代码、零 API 调用）
-Step 0b: hydrate.py → 自动合并全局 + 项目 vault；
-         GLOBAL 条目（两个 vault 均含）无条件注入上下文；
-         按 Jaccard 评分返回 top-k 相关条目
-Step 1: LLM Router → 独立性×认知复杂度 → 选择技巧
-Step 2: 读取技巧详情 → 获取 method_steps + design_rules
-Step 2.5: 条件案例生成 → 仅当用户提供领域知识时生成
-Step 3: 构建增强提示词 → 8 节结构 + 已确认案例
-Step 4: checkpoint.py → 保存到项目 vault（或 --global 写全局）
-Step 5: 行动选择
-        ├── 🚀 立即执行 → 执行 → 分析输出 → 结构化反馈写回 vault
-        │                （status + quality_score + violations）
-        ├── 💾 保存并稍后 → 已持久化；hydrate.py --full 可取出
-        └── 🔍 审查改进 → 加载 prompt-review，新版本自动追加
-```
-
----
-
-## 多项目联邦
-
-PromptCraft 支持双层 vault：
-
-| 层级 | 路径 | 用途 |
-|------|------|------|
-| **全局** | `~/.promptcraft/global_vault.json` | 组织级标准（"所有 SQL 必须有回滚脚本"）、共享模板 |
-| **项目** | `.promptcraft/prompt_vault.json` | 项目特定决策、Bug 相关 prompt |
-
-**hydrate.py** 每次查询自动合并两个 vault。同一 task_id 在两个 vault 中
-都存在时，项目条目优先。使用 `--no-global` 仅搜索项目 vault。
-
-**checkpoint.py** 默认保存到项目 vault。使用 `--global` 保存到全局 vault。
-
-```bash
-# 保存组织级约束到全局 vault
-echo '{"task_id":"org-security","user_intent":"所有合约必须通过 Certora 验证"}' | \
-  python checkpoint.py --global
-
-# 搜索（自动合并两个 vault）
-python hydrate.py --query "审计合约安全"
-
-# 仅搜索项目 vault
-python hydrate.py --query "审计合约" --no-global
-```
-
----
-
-## 安装使用
-
-将 `skills/` 下的 4 个 Skill 目录复制到你的项目或用户 Skills 目录：
-
-```
-your-project/.codex/skills/prompt-craft/
-your-project/.codex/skills/prompt-memory/
-your-project/.codex/skills/prompt-techniques/
-your-project/.codex/skills/prompt-review/
-```
-
-脚本默认以 `.promptcraft/` 为 vault 根目录，`.codex/skills/prompt-memory/scripts/`
-为脚本路径。可通过 `--vault` / `--prompts-dir` 覆盖。
-
-在 CodeBuddy / Codex / Claude Code 对话中：
-
-> 加载 prompt-craft，帮我写一个高质量的提示词
-
-AI 自动执行完整工作流。
-
----
+- **子Agent架构**：隔离上下文，vault持久化，跨会话改进——通过触发器Skill + vault-hydrate预检按需唤醒
+- **批处理**：单次调用处理多任务——hydrate一次，按Skill分组，并行执行（最多4线程）
+- **主动信号**：每次响应附带vault感知的上下文提示（类似任务、常见陷阱），不改变被动触发模型
+- **5层执行边界**：借鉴Claude Code纵深防御，为子Agent真实威胁模型（知识污染，非Shell注入）重新设计
+- **熔断器**：3态状态机（CLOSED → OPEN → HALF_OPEN），拒绝追踪 + 自动冷却
+- **多项目联邦**：双层vault——全局(`~/.promptcraft/`) + 项目(`./.promptcraft/`)
+- **查询扩展**：LLM生成跨语言关键词，突破Jaccard同义词盲区（零代码）
+- **执行反馈闭环**：每次执行后结构化质量评分(1-5)写回vault
+- **Health Report**：紧凑单行信号——`[PC: N records, action=...]`——告知主Agent何时运行分析
+- **Skill-Advisor**：数据支撑的进化/创建建议——绝不自动修改Skill
+- **追加式Vault**：完整版本历史，支持回滚，双存储（JSON索引 + Markdown提示词）
+- **多文字分词器**：中日韩 + 日文假名 + 韩文 + 拉丁 + 西里尔
 
 ## 技术选型
 
-- **仅 Python 标准库**：零外部依赖
-- **双存储架构**：JSON vault = 轻量索引；`.md` 文件 = 完整 Prompt
-- **双层联邦**：全局 vault（`~/`）+ 项目 vault（`./`）
-- **零代码路由**：LLM-as-a-Router 嵌入在 SKILL.md 中
-- **查询扩展**：LLM 生成跨语言关键词（无 embedding、无外部 API）
-- **语义搜索**：Jaccard 相似度，多文字分词（CJK + 拉丁 + 西里尔）
-- **上下文经济**：紧凑模式约 200 token；`--full` 按需读取 `.md`
-- **反馈闭环**：结构化执行反馈自动写回 vault
+- **仅Python标准库** — 无需pip install、无需venv
+- **双存储** — JSON vault（元数据）+ `.md` 文件（完整提示词）
+- **双层联邦** — 全局vault + 项目vault，自动合并
+- **子Agent模型** — 隔离上下文，触发器式唤醒
+- **Jaccard相似度** — 多文字分词器，零外部依赖
+- **零外部API** — 无embedding服务，无专有API
 
 ## 设计原则
 
-- 增强输入质量——不替代模型推理
-- 零外部模型调用——无 API 费用，无 embedding 服务
-- 无私有记忆 API——纯文件系统，人类可读可编辑
-- 不做封闭数据库——vault 可编辑、可 diff、可版本控制
-- 追加不覆盖——版本历史完整保留
-- 双存储：JSON 快速检索元数据，`.md` 保存完整可读 Prompt
-- 联邦：全局 vault 跨项目约束，项目 vault 本地决策
-- 丰富的技术参考——含设计规则、JSON 模板、案例生成规则
+- **增强而非替代** — Skill拥有工作流，PromptCraft提供叠加
+- **Fail-closed** — 守卫不确定就拒绝；MODIFIES_SKILLS是bypass-immune
+- **仅Health Report** — 内部vault状态绝不暴露给主Agent
+- **绝不自动修改Skill** — 仅建议，执行由主Agent负责
+- **importance = blast radius** — GLOBAL影响所有项目，升级需数据支撑
+- **追加不覆盖** — 完整版本历史保留
+- **零外部依赖** — 纯文件系统，人类可读JSON/Markdown
 
 ## 许可证
 

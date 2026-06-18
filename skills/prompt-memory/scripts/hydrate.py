@@ -35,6 +35,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_VAULT = Path(".promptcraft/prompt_vault.json")
@@ -65,6 +66,8 @@ _SUMMARY_WEIGHTS = {
 
 # Default score threshold for auto-injecting full prompt text
 DEFAULT_AUTO_FULL_THRESHOLD = 0.75
+FRESHNESS_STALE_DAYS = 30       # Entries older than this get a freshness penalty
+FRESHNESS_PENALTY_FACTOR = 0.7  # Multiply score by this factor for stale entries
 
 
 def _read_vault(path: Path) -> dict:
@@ -165,7 +168,54 @@ def _score(query_tokens: set[str], entry: dict) -> float:
                 field_text = str(value) if value else ""
             if field_text:
                 score += _jaccard(query_tokens, _tokenize(field_text)) * weight
+
+    # ── Freshness penalty: stale entries (>30 days) get score reduced ──
+    timestamp = entry.get("timestamp", "")
+    if timestamp:
+        try:
+            ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            days_old = (now - ts).days
+            if days_old > FRESHNESS_STALE_DAYS:
+                score *= FRESHNESS_PENALTY_FACTOR
+        except ValueError:
+            pass  # Unparseable timestamp — no penalty (conservative)
+
     return round(score, 4)
+
+
+def _freshness(timestamp: str) -> str:
+    """Return human-readable age. 'today', 'yesterday', '47 days ago'."""
+    if not timestamp:
+        return "unknown"
+    try:
+        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        days = (now - ts).days
+        if days == 0:
+            return "today"
+        if days == 1:
+            return "yesterday"
+        return f"{days} days ago"
+    except ValueError:
+        return "unknown"
+
+
+def _freshness_warning(timestamp: str) -> str:
+    """Freshness warning for entries > 1 day old (Claude Code pattern).
+
+    Memories are point-in-time observations, not live state.
+    Claims about code behavior or file locations may be outdated.
+    """
+    days_str = _freshness(timestamp)
+    if days_str in ("today", "yesterday", "unknown"):
+        return ""
+    return (
+        f"This vault entry is {days_str} old. "
+        "Memories are point-in-time observations, not live state — "
+        "claims about code behavior or file locations may be outdated. "
+        "Verify against current code before asserting as fact."
+    )
 
 
 def _compact_entry(entry: dict, *, include_prompt: bool = False) -> dict:
@@ -211,6 +261,13 @@ def _compact_entry(entry: dict, *, include_prompt: bool = False) -> dict:
         # Include preview alongside full prompt for quick identification
         if entry.get("generated_prompt_preview"):
             compact["generated_prompt_preview"] = entry["generated_prompt_preview"]
+
+    # Freshness: human-readable age + warning for entries > 1 day
+    if entry.get("timestamp"):
+        compact["freshness"] = _freshness(entry["timestamp"])
+        warning = _freshness_warning(entry["timestamp"])
+        if warning:
+            compact["freshness_warning"] = warning
 
     return {k: v for k, v in compact.items() if v not in (None, "", [], 0) or k in ("score",)}
 
@@ -400,6 +457,100 @@ def cmd_list_versions(args, vault: dict) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def cmd_aggregate(args, vault: dict) -> None:
+    """Aggregate entries by a field, computing stats for Pattern Analysis.
+
+    Three-tier gating hints are attached based on record counts:
+      - >= 10: pattern_ready (internal observation)
+      - >= 20 with >= 35% low-quality: evolution_ready (Skill change suggested)
+      - >= 30: creation_ready (new Skill suggested)
+    """
+    group_by = str(getattr(args, "group_by", "task_type") or "task_type")
+    min_records = int(getattr(args, "min_records", 10) or 10)
+    task_type_filter = getattr(args, "task_type", None)
+
+    entries = vault.get("entries", [])
+
+    if task_type_filter:
+        entries = [e for e in entries if e.get("task_type") == task_type_filter]
+
+    # Group entries
+    groups: dict[str, list[dict]] = {}
+    for e in entries:
+        key = str(e.get(group_by, "")).strip()
+        if not key:
+            continue
+        groups.setdefault(key, []).append(e)
+
+    # Compute stats per group
+    results: list[dict] = []
+    for key, group_entries in sorted(groups.items()):
+        total = len(group_entries)
+        if total < min_records:
+            continue
+
+        scores = [
+            e["quality_score"]
+            for e in group_entries
+            if isinstance(e.get("quality_score"), (int, float)) and e["quality_score"] > 0
+        ]
+        avg_quality = round(sum(scores) / len(scores), 2) if scores else 0
+
+        # High-frequency overlays (>= 50% of records in this group)
+        overlay_counts: dict[str, int] = {}
+        for e in group_entries:
+            for ov in e.get("overlay_used", []):
+                overlay_counts[ov] = overlay_counts.get(ov, 0) + 1
+        high_freq = [
+            {"overlay": ov, "count": c, "pct": round(c / total * 100)}
+            for ov, c in overlay_counts.items()
+            if c / total >= 0.5
+        ]
+        high_freq.sort(key=lambda x: x["count"], reverse=True)
+
+        # Low-quality ratio (score < 3)
+        low_count = sum(1 for s in scores if s < 3)
+        low_ratio = round(low_count / len(scores), 2) if scores else 0
+
+        # Latest entry timestamp
+        timestamps = [
+            e["timestamp"]
+            for e in group_entries
+            if e.get("timestamp")
+        ]
+        latest = max(timestamps) if timestamps else ""
+
+        # Three-tier gating
+        if total >= 30:
+            gate = "creation_ready"
+        elif total >= 20 and low_ratio >= 0.35:
+            gate = "evolution_ready"
+        elif total >= 10:
+            gate = "pattern_ready"
+        else:
+            gate = "insufficient"
+
+        results.append({
+            "group_key": key,
+            "total_records": total,
+            "avg_quality": avg_quality,
+            "high_freq_overlays": high_freq,
+            "low_quality_ratio": low_ratio,
+            "latest_timestamp": latest,
+            "gate": gate,
+        })
+
+    results.sort(key=lambda r: r["total_records"], reverse=True)
+
+    print(json.dumps({
+        "status": "ok",
+        "aggregate_by": group_by,
+        "min_records": min_records,
+        "groups": len(results),
+        "results": results,
+    }, ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hydrate prompt context from the vault.")
     parser.add_argument("--query", help="Query text for semantic search.")
@@ -410,6 +561,12 @@ def main() -> None:
     parser.add_argument("--auto-full-threshold", type=float, default=DEFAULT_AUTO_FULL_THRESHOLD,
                         help=f"Score threshold above which full prompt is auto-injected (default: {DEFAULT_AUTO_FULL_THRESHOLD}).")
     parser.add_argument("--no-global", action="store_true", help="Skip the global vault (~/.promptcraft/global_vault.json) — only search the project vault.")
+    parser.add_argument("--aggregate", action="store_true", help="Aggregate query mode: group entries by a field and compute stats for Pattern Analysis.")
+    parser.add_argument("--group-by", default="task_type", choices=["task_type", "skill_used", "technique"],
+                        help="Field to group by in aggregate mode (default: task_type).")
+    parser.add_argument("--min-records", type=int, default=10,
+                        help="Only return groups with at least this many records (default: 10).")
+    parser.add_argument("--task-type", help="Filter by task_type in aggregate mode.")
     parser.add_argument("--rollback-to", help="Version tag to rollback to (requires --task-id).")
     parser.add_argument("--list-versions", action="store_true", help="List all versions for a task.")
     parser.add_argument("--vault", type=Path, default=DEFAULT_VAULT, help="Path to prompt_vault.json.")
@@ -422,10 +579,12 @@ def main() -> None:
         cmd_list_versions(args, vault)
     elif args.rollback_to:
         cmd_rollback(args, vault)
+    elif args.aggregate:
+        cmd_aggregate(args, vault)
     elif args.query:
         cmd_query(args, vault)
     else:
-        print(json.dumps({"status": "error", "message": "Provide --query, --rollback-to, or --list-versions."}))
+        print(json.dumps({"status": "error", "message": "Provide --query, --aggregate, --rollback-to, or --list-versions."}))
         sys.exit(1)
 
 

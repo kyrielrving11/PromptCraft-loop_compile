@@ -393,5 +393,147 @@ class TestFederation(unittest.TestCase):
                 shutil.rmtree(prompts_dir)
 
 
+class TestAggregate(unittest.TestCase):
+    """Tests for hydrate.py --aggregate mode (v3 memory module)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_aggregate_basic(self):
+        """Aggregate groups entries by task_type and returns correct counts."""
+        vault_path = self.tmp_path / "vault.json"
+        vault = {"version": "1", "entries": []}
+        prompts_dir = self.tmp_path / "prompts"
+
+        # Create 12 solidity_audit entries with varying quality
+        for i in range(12):
+            payload = {
+                "task_id": f"audit-{i}", "user_intent": f"audit {i}",
+                "task_type": "solidity_audit",
+                "quality_score": 5 if i < 8 else 2,
+                "overlay_used": ["gas-check"] if i % 2 == 0 else [],
+            }
+            entry = checkpoint._build_entry(payload, vault, prompts_dir, None)
+            # _build_entry appends to vault["entries"] and sets is_active
+        checkpoint._write_vault(vault_path, vault)
+
+        # Reread and aggregate
+        vault2 = hydrate._read_vault(vault_path)
+
+        class Args:
+            group_by = "task_type"
+            min_records = 10
+            task_type = None
+
+        import io, sys
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        hydrate.cmd_aggregate(Args(), vault2)
+        output = sys.stdout.getvalue()
+        sys.stdout = old_stdout
+
+        data = json.loads(output)
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["groups"], 1)
+        self.assertEqual(data["results"][0]["group_key"], "solidity_audit")
+        self.assertEqual(data["results"][0]["total_records"], 12)
+
+    def test_aggregate_min_records(self):
+        """Groups below min_records threshold are filtered out."""
+        vault_path = self.tmp_path / "vault.json"
+        vault = {"version": "1", "entries": []}
+        prompts_dir = self.tmp_path / "prompts"
+
+        for i in range(5):
+            payload = {
+                "task_id": f"api-{i}", "user_intent": f"api {i}",
+                "task_type": "api_design", "quality_score": 4,
+            }
+            checkpoint._build_entry(payload, vault, prompts_dir, None)
+        checkpoint._write_vault(vault_path, vault)
+
+        vault2 = hydrate._read_vault(vault_path)
+
+        class Args:
+            group_by = "task_type"
+            min_records = 10
+            task_type = None
+
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        hydrate.cmd_aggregate(Args(), vault2)
+        output = sys.stdout.getvalue()
+        sys.stdout = old_stdout
+
+        data = json.loads(output)
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(data["groups"], 0)  # 5 < 10, filtered out
+
+    def test_aggregate_gate(self):
+        """Three-tier gate markers are assigned correctly."""
+        vault_path = self.tmp_path / "vault.json"
+        vault = {"version": "1", "entries": []}
+        prompts_dir = self.tmp_path / "prompts"
+
+        # 10 records → pattern_ready
+        for i in range(10):
+            payload = {
+                "task_id": f"task-{i}", "user_intent": f"task {i}",
+                "task_type": "pattern_test",
+                "quality_score": 4,
+            }
+            checkpoint._build_entry(payload, vault, prompts_dir, None)
+        checkpoint._write_vault(vault_path, vault)
+
+        vault2 = hydrate._read_vault(vault_path)
+
+        class Args:
+            group_by = "task_type"
+            min_records = 10
+            task_type = None
+
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        hydrate.cmd_aggregate(Args(), vault2)
+        output = sys.stdout.getvalue()
+        sys.stdout = old_stdout
+
+        data = json.loads(output)
+        self.assertEqual(data["groups"], 1)
+        self.assertEqual(data["results"][0]["gate"], "pattern_ready")
+
+
+class TestFreshness(unittest.TestCase):
+    """Tests for freshness calculation in hydrate.py (v3 memory module)."""
+
+    def test_freshness_today(self):
+        """Timestamp from today returns 'today' and no warning."""
+        ts_today = "2026-06-17T10:00:00Z"
+        self.assertEqual(hydrate._freshness(ts_today), "today")
+        self.assertEqual(hydrate._freshness_warning(ts_today), "")
+
+    def test_freshness_warning(self):
+        """Timestamp from 3 days ago returns warning text."""
+        ts_old = "2026-06-14T10:00:00Z"
+        freshness = hydrate._freshness(ts_old)
+        self.assertIn("days ago", freshness)
+        warning = hydrate._freshness_warning(ts_old)
+        self.assertIn("point-in-time", warning)
+        self.assertIn("Verify against current code", warning)
+
+    def test_freshness_unknown(self):
+        """Empty or invalid timestamp returns 'unknown' and no warning."""
+        self.assertEqual(hydrate._freshness(""), "unknown")
+        self.assertEqual(hydrate._freshness_warning(""), "")
+        self.assertEqual(hydrate._freshness("not-a-timestamp"), "unknown")
+        self.assertEqual(hydrate._freshness_warning("not-a-timestamp"), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,6 +1,9 @@
 # PromptCraft generated files
 .promptcraft/
 
+# Claude Code
+settings.local.json
+
 # Python
 __pycache__/
 *.pyc
