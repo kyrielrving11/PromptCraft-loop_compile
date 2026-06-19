@@ -1,5 +1,9 @@
 """Build the final Agent system prompt from the 7-layer template.
 
+This is a DEPLOYMENT-TIME utility — it generates the system prompt file that
+the sub-agent reads at startup. It is NOT a runtime Tool in the ToolRegistry
+and is NOT called during normal engine operation.
+
 Reads SYSTEM_PROMPT.md from the same directory and replaces <placeholder>
 variables with runtime values. Outputs the complete system prompt to stdout.
 

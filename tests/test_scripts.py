@@ -514,13 +514,21 @@ class TestFreshness(unittest.TestCase):
 
     def test_freshness_today(self):
         """Timestamp from today returns 'today' and no warning."""
-        ts_today = "2026-06-17T10:00:00Z"
+        from datetime import datetime, timezone
+        ts_today = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         self.assertEqual(hydrate._freshness(ts_today), "today")
         self.assertEqual(hydrate._freshness_warning(ts_today), "")
 
+    def test_freshness_yesterday(self):
+        """Timestamp from yesterday returns 'yesterday'."""
+        from datetime import datetime, timezone, timedelta
+        ts_yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0).isoformat()
+        self.assertEqual(hydrate._freshness(ts_yesterday), "yesterday")
+
     def test_freshness_warning(self):
         """Timestamp from 3 days ago returns warning text."""
-        ts_old = "2026-06-14T10:00:00Z"
+        from datetime import datetime, timezone, timedelta
+        ts_old = (datetime.now(timezone.utc) - timedelta(days=3)).replace(microsecond=0).isoformat()
         freshness = hydrate._freshness(ts_old)
         self.assertIn("days ago", freshness)
         warning = hydrate._freshness_warning(ts_old)

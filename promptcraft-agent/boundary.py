@@ -66,6 +66,7 @@ _SUSPICIOUS_PATTERNS = [
 ]
 
 MIN_TASK_LENGTH = 3
+MAX_TASK_LENGTH = 65536  # 64 KB hard cap — prevents memory DoS from oversized input
 MIN_COMPLEXITY_SCORE = 0.15  # Below this, not worth PromptCraft invocation
 
 
@@ -85,6 +86,13 @@ def guard_input(
     # 1.1 Task non-empty and above minimum length
     if not task or len(task.strip()) < MIN_TASK_LENGTH:
         return deny("Task too short or empty — cannot generate meaningful prompt.")
+
+    # 1.1b Task below maximum length (DoS protection)
+    if len(task) > MAX_TASK_LENGTH:
+        return deny(
+            f"Task exceeds max length ({MAX_TASK_LENGTH} bytes). "
+            "Split into smaller tasks or use batch mode."
+        )
 
     # 1.2 Injection detection
     for pattern, label in _SUSPICIOUS_PATTERNS:

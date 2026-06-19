@@ -5,8 +5,9 @@ description: >
   checkpoint.py (save prompt contexts to .promptcraft/prompt_vault.json with
   Git-style immutable version log) and hydrate.py (semantic search with
   keyword overlap scoring, version rollback, and version history listing).
-  Use when prompt-craft or prompt-review needs to persist or load prompt
-  history. ALL persistence is file-based — no host memory API, no database.
+  Use when the PromptCraft engine (promptcraft-agent/engine.py) or other tools
+  need to persist or load prompt history. ALL persistence is file-based — no
+  host memory API, no database.
 ---
 
 # Prompt Memory Management
@@ -19,40 +20,29 @@ project working directory as human-readable, editable JSON.
 
 ### `scripts/checkpoint.py` — Save a prompt checkpoint
 
-Executed after prompt-craft or prompt-review produces a prompt. Appends to the vault
-without overwriting previous versions. Manages `version_tag`, `is_active`, and
-`parent_version` automatically.
+Executed after the PromptCraft engine produces a prompt (via invoke_build, invoke_feedback,
+or the feedback loop). Appends to the vault without overwriting previous versions.
+Manages `version_tag`, `is_active`, and `parent_version` automatically.
 
 When to call:
-- After Step 4 of prompt-craft's workflow (new or versioned save).
-- After prompt-review produces an improved version.
-- After prompt-craft's Step 5c (execution feedback write-back) — append feedback as a
+- After engine.invoke_build() produces a new prompt (new or versioned save).
+- After engine.invoke_feedback() records execution results.
+- After the feedback loop writes improvement notes — append feedback as a
   new version using `--version-of`, with `importance: "REFERENCE"`.
 
 ### `scripts/hydrate.py` — Load and filter prompt history
 
-Executed at the start of a new prompt-craft session. Performs keyword-overlap semantic
+Executed at the start of a new PromptCraft engine session. Performs keyword-overlap semantic
 search against the vault and returns only `is_active` versions of matching tasks.
 By default returns compact results (metadata only, ~500 tokens). Use `--full` to
 include the complete generated prompt text for reuse.
 
-**Query Expansion (best practice):**
+**Query Expansion (automatic):**
 
-hydrate.py uses Jaccard similarity — it matches exact tokens only. "审计权限" and
-"access control" have zero overlap despite being semantically identical. Before
-calling hydrate.py, expand the query with cross-language synonyms and related
-technical terms:
-
-```
-# Poor (single-language, narrow):
-hydrate.py --query "审计 ERC-20 合约的权限控制逻辑"
-
-# Good (expanded with cross-language synonyms):
-hydrate.py --query "审计 ERC-20 合约的权限控制逻辑 access control authorization ownership mint burn permission check ownable"
-```
-
-The expanded query creates token overlap with vault entries in either language,
-dramatically improving recall without changing the scoring algorithm.
+hydrate.py automatically expands queries with cross-language synonyms
+(CJK→EN mapping) and compound-term detection before Jaccard search —
+see `_QUERY_SYNONYMS` and `_expand_query()` in hydrate.py. No manual
+query expansion needed.
 
 **Query response structure:**
 
@@ -112,7 +102,7 @@ python hydrate.py --query "audit contract" --no-global
 
 ## When to Use This Skill
 
-Load `prompt-memory` alongside `prompt-craft` or `prompt-review`. The scripts are
+Load `prompt-memory` alongside `promptcraft-agent/engine.py`. The scripts are
 deterministic — execute them directly rather than loading them into the AI's context.
 
 ## Reference

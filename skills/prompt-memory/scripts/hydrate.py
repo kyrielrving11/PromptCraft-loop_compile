@@ -35,7 +35,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 DEFAULT_VAULT = Path(".promptcraft/prompt_vault.json")
@@ -119,6 +119,120 @@ def _tokenize(text: str) -> set[str]:
     # Latin (with diacritics) + Cyrillic
     tokens.update(t.lower() for t in re.findall(r"[A-Za-zÀ-ɏЀ-ӿ]+", text))
     return tokens
+
+
+# ── Query Expansion ────────────────────────────────────────────────────────────
+# Zero-dependency synonym map — expands query tokens with domain-related terms
+# before Jaccard search. Improves recall for cross-language and domain-jargon
+# queries without requiring an LLM or embedding service.
+
+_QUERY_SYNONYMS: dict[str, list[str]] = {
+    # Security / Audit
+    "audit":      ["security", "review", "vulnerability", "check", "inspect"],
+    "security":   ["audit", "vulnerability", "exploit", "protection", "safe"],
+    "vulnerability": ["bug", "exploit", "flaw", "weakness", "security"],
+    # Smart contracts
+    "contract":   ["solidity", "evm", "smart-contract", "token", "erc"],
+    "solidity":   ["contract", "evm", "smart-contract", "foundry", "hardhat"],
+    "token":      ["erc20", "erc721", "nft", "fungible", "mint"],
+    # Testing
+    "test":       ["unit-test", "coverage", "verify", "assert", "spec"],
+    "testing":    ["test", "unit-test", "integration-test", "coverage", "fuzz"],
+    # API
+    "api":        ["rest", "graphql", "endpoint", "route", "http", "rpc"],
+    "endpoint":   ["api", "route", "handler", "controller", "path"],
+    # Database
+    "database":   ["sql", "nosql", "storage", "migration", "schema", "index", "db"],
+    "sql":        ["query", "database", "table", "schema", "migration"],
+    # DevOps
+    "deploy":     ["ci-cd", "docker", "kubernetes", "release", "pipeline"],
+    "docker":     ["container", "image", "deploy", "kubernetes", "compose"],
+    # Frontend
+    "react":      ["component", "frontend", "ui", "state", "hook"],
+    "ui":         ["frontend", "react", "component", "view", "render"],
+    "css":        ["style", "layout", "design", "ui", "frontend"],
+    # CLI / Shell
+    "cli":        ["terminal", "shell", "bash", "command-line", "script"],
+    "bash":       ["shell", "script", "cli", "terminal", "command"],
+    # General engineering
+    "refactor":   ["improve", "clean", "restructure", "simplify", "rewrite"],
+    "fix":        ["bug", "repair", "correct", "patch", "resolve"],
+    "optimize":   ["performance", "speed", "fast", "efficient", "improve"],
+    "docs":       ["documentation", "readme", "comment", "explain", "document"],
+    # Rust
+    "rust":       ["cargo", "wasm", "systems-programming", "memory", "ownership"],
+    # Python
+    "python":     ["django", "flask", "fastapi", "pytest", "script"],
+    # TypeScript / JS
+    "typescript": ["javascript", "node", "react", "next", "frontend", "ts"],
+    "javascript":  ["typescript", "node", "js", "frontend", "browser"],
+    # Chinese → English mapping for common dev terms
+    "审计":        ["audit", "security", "review"],
+    "测试":        ["test", "testing", "verify"],
+    "部署":        ["deploy", "release", "ci-cd"],
+    "重构":        ["refactor", "improve", "clean"],
+    "修复":        ["fix", "bug", "patch"],
+    "优化":        ["optimize", "performance", "improve"],
+    "文档":        ["docs", "documentation", "readme"],
+    "安全":        ["security", "audit", "protect"],
+    "合约":        ["contract", "solidity", "smart-contract"],
+    "接口":        ["api", "endpoint", "interface"],
+    "数据库":      ["database", "sql", "storage", "db"],
+    "前端":        ["frontend", "ui", "react", "component"],
+}
+
+# Compound term mapping: multi-word sequences that should be treated as a unit
+# before synonym expansion. E.g. "smart contract" → "smart-contract"
+_COMPOUND_TERMS: dict[str, str] = {
+    "smart contract": "smart-contract",
+    "unit test":      "unit-test",
+    "ci cd":          "ci-cd",
+    "command line":   "command-line",
+    "tree of thought": "tree-of-thought",
+    "chain of thought": "chain-of-thought",
+    "least to most":  "least-to-most",
+    "step back":      "step-back",
+    "few shot":       "few-shot",
+    "zero shot":      "zero-shot",
+    "code review":    "code-review",
+    "pull request":   "pull-request",
+    "open source":    "open-source",
+}
+
+
+def _expand_query(query: str) -> set[str]:
+    """Expand query tokens with synonyms for cross-language/domain-jargon recall.
+
+    Steps:
+      1. Tokenize the original query
+      2. Detect and merge compound terms (e.g. "smart contract" → "smart-contract")
+      3. For each token, look up synonyms from _QUERY_SYNONYMS
+      4. Return original tokens ∪ synonym tokens
+
+    The expansion is conservative: only 1-hop synonyms, max 5 per token.
+    This is a zero-dependency alternative to LLM-generated cross-language
+    keywords — the synonym map is hand-curated per domain.
+    """
+    query_lower = query.lower().strip()
+
+    # Step 1: tokenize original
+    original = _tokenize(query)
+
+    # Step 2: compound term detection — merge multi-word sequences
+    compound_additions: set[str] = set()
+    for compound, replacement in _COMPOUND_TERMS.items():
+        if compound in query_lower:
+            compound_additions.add(replacement)
+
+    # Step 3: synonym expansion
+    synonym_tokens: set[str] = set()
+    for token in original:
+        synonyms = _QUERY_SYNONYMS.get(token, [])
+        for syn in synonyms[:5]:  # Cap at 5 synonyms per token
+            synonym_tokens.add(syn)
+
+    # Step 4: union
+    return original | compound_additions | synonym_tokens
 
 
 def _jaccard(set_a: set[str], set_b: set[str]) -> float:
@@ -320,7 +434,7 @@ def cmd_query(args, vault: dict) -> None:
         print(json.dumps({"status": "error", "message": "--query is required."}))
         sys.exit(1)
 
-    query_tokens = _tokenize(query)
+    query_tokens = _expand_query(query)
 
     # ── Merge global vault (unless --no-global) ──
     use_global = not getattr(args, "no_global", False)
@@ -551,6 +665,114 @@ def cmd_aggregate(args, vault: dict) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def cmd_prune(args, vault: dict) -> None:
+    """Remove stale vault entries by age and importance.
+
+    Safety rules:
+      - GLOBAL entries are NEVER pruned (blast-radius protection).
+      - STAGE entries are NEVER pruned (still potentially useful).
+      - Only WORKING and REFERENCE entries are candidates by default.
+      - .md files are NOT deleted — the append-only guarantee for .md is preserved.
+      - --dry-run shows what would be pruned without modifying the vault.
+
+    Usage:
+      python hydrate.py --prune --older-than 90
+      python hydrate.py --prune --older-than 30 --importance WORKING --dry-run
+    """
+    older_than_days = int(getattr(args, "older_than", 90) or 90)
+    importance_filter = str(getattr(args, "importance", "WORKING,REFERENCE") or "WORKING,REFERENCE")
+    dry_run = bool(getattr(args, "dry_run", False))
+    allowed_importance = {i.strip().upper() for i in importance_filter.split(",") if i.strip()}
+
+    # NEVER prune these importance levels
+    PROTECTED = {"GLOBAL", "STAGE", "SKILL_SUGGESTION"}
+    allowed_importance -= PROTECTED
+
+    if not allowed_importance:
+        print(json.dumps({
+            "status": "error",
+            "message": f"No prunable importance levels in filter '{importance_filter}'. "
+                       f"Protected: {sorted(PROTECTED)}.",
+        }))
+        sys.exit(1)
+
+    entries = vault.get("entries", [])
+    if not entries:
+        print(json.dumps({"status": "ok", "pruned": 0, "message": "Vault is empty."}))
+        return
+
+    # Compute cutoff timestamp
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=older_than_days)
+
+    kept: list[dict] = []
+    pruned: list[dict] = []
+    protected_count = 0
+
+    for entry in entries:
+        # Determine importance
+        summary = entry.get("summary")
+        importance = summary.get("importance", "").upper() if isinstance(summary, dict) else ""
+
+        # Never prune protected levels
+        if importance in PROTECTED:
+            kept.append(entry)
+            protected_count += 1
+            continue
+
+        # Only prune the allowed importance levels
+        if importance not in allowed_importance:
+            kept.append(entry)
+            continue
+
+        # Check age
+        timestamp = entry.get("timestamp", "")
+        if not timestamp:
+            kept.append(entry)  # No timestamp → can't determine age, keep
+            continue
+
+        try:
+            ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if ts < cutoff:
+                pruned.append(entry)
+            else:
+                kept.append(entry)
+        except ValueError:
+            kept.append(entry)  # Unparseable timestamp → keep
+
+    if dry_run:
+        print(json.dumps({
+            "status": "ok",
+            "dry_run": True,
+            "candidates": len(pruned),
+            "would_keep": len(kept),
+            "protected": protected_count,
+            "summary": [{
+                "task_id": e.get("task_id", ""),
+                "version_tag": e.get("version_tag", ""),
+                "timestamp": e.get("timestamp", ""),
+                "importance": (e.get("summary") or {}).get("importance", "") if isinstance(e.get("summary"), dict) else "",
+            } for e in pruned],
+        }, ensure_ascii=False, indent=2))
+        return
+
+    if not pruned:
+        print(json.dumps({"status": "ok", "pruned": 0, "message": "No stale entries found."}))
+        return
+
+    vault["entries"] = kept
+    _write_vault(args.vault, vault)
+
+    print(json.dumps({
+        "status": "ok",
+        "pruned": len(pruned),
+        "kept": len(kept),
+        "protected": protected_count,
+        "older_than_days": older_than_days,
+        "vault": str(args.vault),
+    }, ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hydrate prompt context from the vault.")
     parser.add_argument("--query", help="Query text for semantic search.")
@@ -571,11 +793,22 @@ def main() -> None:
     parser.add_argument("--list-versions", action="store_true", help="List all versions for a task.")
     parser.add_argument("--vault", type=Path, default=DEFAULT_VAULT, help="Path to prompt_vault.json.")
     parser.add_argument("--prompts-dir", type=Path, default=DEFAULT_PROMPTS_DIR, help="Directory for .md prompt files.")
+    parser.add_argument("--prune", action="store_true",
+                        help="Remove stale entries from vault. Use with --older-than and --importance.")
+    parser.add_argument("--older-than", type=int, default=90,
+                        help="Remove entries older than this many days (default: 90). Used with --prune.")
+    parser.add_argument("--importance", default="WORKING,REFERENCE",
+                        help="Comma-separated importance levels to prune (default: WORKING,REFERENCE). "
+                             "GLOBAL entries are NEVER pruned. Used with --prune.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be pruned without actually removing. Used with --prune.")
     args = parser.parse_args()
 
     vault = _read_vault(args.vault)
 
-    if args.list_versions:
+    if args.prune:
+        cmd_prune(args, vault)
+    elif args.list_versions:
         cmd_list_versions(args, vault)
     elif args.rollback_to:
         cmd_rollback(args, vault)
@@ -584,7 +817,7 @@ def main() -> None:
     elif args.query:
         cmd_query(args, vault)
     else:
-        print(json.dumps({"status": "error", "message": "Provide --query, --aggregate, --rollback-to, or --list-versions."}))
+        print(json.dumps({"status": "error", "message": "Provide --query, --aggregate, --rollback-to, --list-versions, or --prune."}))
         sys.exit(1)
 
 

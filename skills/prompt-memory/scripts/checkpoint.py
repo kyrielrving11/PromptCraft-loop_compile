@@ -195,6 +195,8 @@ def main() -> None:
     parser.add_argument("--vault", type=Path, default=DEFAULT_VAULT, help="Path to prompt_vault.json.")
     parser.add_argument("--prompts-dir", type=Path, default=DEFAULT_PROMPTS_DIR, help="Directory for .md prompt files.")
     parser.add_argument("--version-of", help="task_id to create a new version for.")
+    parser.add_argument("--batch", action="store_true",
+                        help="Read NDJSON (one JSON object per line) from stdin and process each as a separate entry.")
     args = parser.parse_args()
 
     # ── Route to global vault when --global is set ──
@@ -204,6 +206,50 @@ def main() -> None:
             args.vault = GLOBAL_VAULT
         if args.prompts_dir == DEFAULT_PROMPTS_DIR:
             args.prompts_dir = GLOBAL_PROMPTS_DIR
+
+    # ── Batch mode: read NDJSON from stdin ──
+    if args.batch:
+        raw = sys.stdin.buffer.read().decode("utf-8-sig").strip()
+        if not raw:
+            print(json.dumps({"status": "error", "message": "No input provided for batch."}))
+            sys.exit(1)
+        lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+        payloads: list[dict] = []
+        for line in lines:
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    payloads.append(obj)
+            except json.JSONDecodeError:
+                pass  # Skip malformed lines
+
+        if not payloads:
+            print(json.dumps({"status": "error", "message": "No valid JSON objects in batch input."}))
+            sys.exit(1)
+
+        vault = _read_vault(args.vault)
+        saved = 0
+        errors = 0
+        for payload in payloads:
+            # Each batch entry gets a unique task_id if none provided
+            if "task_id" not in payload:
+                payload["task_id"] = f"feedback:{uuid.uuid4().hex[:8]}"
+            try:
+                _build_entry(payload, vault, args.prompts_dir, args.version_of)
+                saved += 1
+            except ValueError:
+                errors += 1
+
+        _write_vault(args.vault, vault)
+        print(json.dumps({
+            "status": "saved",
+            "batch": True,
+            "saved": saved,
+            "errors": errors,
+            "entries_count": len(vault["entries"]),
+            "vault": str(args.vault),
+        }, ensure_ascii=False))
+        return
 
     if args.input:
         with args.input.open("r", encoding="utf-8-sig") as f:

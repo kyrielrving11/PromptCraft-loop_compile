@@ -21,6 +21,37 @@ from typing import Any
 from protocol import OverlayConfig, PatternReport, SkillAdvice
 
 
+# ── Engine Metrics ────────────────────────────────────────────────────────────
+
+@dataclass
+class EngineMetrics:
+    """Observability counters for silent/non-blocking operations.
+
+    Silent failures (subprocess timeouts, vault write errors, cache misses)
+    are tracked here so the HealthReport can surface degradation without
+    breaking the fail-closed contract.
+
+    All counters are monotonic within a session.
+    """
+    vault_write_errors: int = 0       # subprocess failures writing feedback
+    vault_write_timeouts: int = 0     # subprocess timeouts
+    vault_write_bytes: int = 0        # total bytes written to vault this session
+    silent_analysis_errors: int = 0   # exceptions caught in maybe_silent_analyze
+    subprocess_timeouts: int = 0      # any subprocess timeout (hydrate, checkpoint)
+    hydrate_cache_misses: int = 0     # hydrate queries that missed the cache
+    feedback_buffer_flushes: int = 0  # times the feedback buffer was flushed
+    feedback_buffer_max_size: int = 0 # peak buffer size before flush
+    session_start: float = 0.0        # monotonic timestamp
+
+    FEEDBACK_FLUSH_INTERVAL = 5       # flush buffer every N feedback records
+
+    def should_flush(self) -> bool:
+        """True when the feedback buffer should be flushed to vault."""
+        return (self.vault_write_errors + self.vault_write_timeouts +
+                self.feedback_buffer_flushes * self.FEEDBACK_FLUSH_INTERVAL) == 0  # always flush if no errors
+        # After errors accumulate, flush less aggressively
+
+
 @dataclass
 class EngineContext:
     """Per-session context shared across all Tools in one Engine session.

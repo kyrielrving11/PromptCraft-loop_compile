@@ -46,6 +46,7 @@ class CircuitBreakerState:
     total_vault_writes: int = 0
     total_denials: int = 0          # Session total (cf. Claude Code's maxTotal: 20)
     session_start: float = field(default_factory=time.monotonic)
+    last_low_quality_time: float = 0.0       # monotonic timestamp of last low-quality event
     state: BreakerState = BreakerState.CLOSED
     last_state_change: float = field(default_factory=time.monotonic)
 
@@ -131,13 +132,24 @@ class CircuitBreaker:
 
         This is the LOW-QUALITY-ONLY stall detection (cf. health_report.py's
         stall detection: only low quality (<=3) counts as stall).
+
+        Includes time-based decay: if the last low-quality record was more than
+        60 seconds ago, the counter auto-resets to 1 (this occurrence). This
+        prevents oscillation between scores 2-3 from never resetting.
         """
+        now = time.monotonic()
+        elapsed = now - self._state.last_low_quality_time
+        if elapsed > 60.0:  # 60-second decay window
+            self._state.consecutive_low_quality = 0  # reset → this is a fresh stall
+
         self._state.consecutive_low_quality += 1
+        self._state.last_low_quality_time = now
         return self._state.consecutive_low_quality >= self.limits.max_consecutive_low_quality
 
     def reset_quality_stall(self) -> None:
         """Reset low-quality counter when a good-quality result arrives."""
         self._state.consecutive_low_quality = 0
+        self._state.last_low_quality_time = 0.0
 
     def can_write_vault(self) -> bool:
         """Check if vault write is allowed (rate limit)."""

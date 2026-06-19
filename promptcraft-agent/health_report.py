@@ -79,6 +79,9 @@ class HealthReport:
     # ── Proactive awareness (vault context without changing passive model) ──
     proactive_signals: list[str] = field(default_factory=list)
 
+    # ── Session metrics (observability) ──
+    metrics: Any | None = None   # EngineMetrics from engine session
+
     def compact_str(self, breaker_state: str = "") -> str:
         """Single-line format — doesn't consume main agent context.
 
@@ -87,22 +90,33 @@ class HealthReport:
             [PC: 25 records, signals=3, action=review_evolution]
             [PC: 8 records, STALLED, action=stalled_needs_human]
             [PC: 12 records, BREAKER=OPEN, action=stalled_needs_human]
+            [PC: 10 records, errs=3, action=run_analysis]
         """
+        # Metrics degradation suffix
+        degradation = ""
+        if self.metrics:
+            errs = (self.metrics.vault_write_errors + self.metrics.vault_write_timeouts
+                    + self.metrics.silent_analysis_errors + self.metrics.subprocess_timeouts)
+            if errs > 0:
+                degradation = f", errs={errs}"
+
         # Build signal count suffix if proactive signals present
         signal_part = ""
         if self.proactive_signals:
             signal_part = f", signals={len(self.proactive_signals)}"
 
         if self.recommended_action == "none":
-            line = f"[PC: {self.feedback_buffer_size} records{signal_part}, normal]"
+            line = f"[PC: {self.feedback_buffer_size} records{degradation}{signal_part}, normal]"
             if breaker_state and breaker_state != "CLOSED":
-                line = f"[PC: {self.feedback_buffer_size} records{signal_part}, breaker={breaker_state}, normal]"
+                line = f"[PC: {self.feedback_buffer_size} records{degradation}{signal_part}, breaker={breaker_state}, normal]"
             return line
         parts = [f"[PC: {self.feedback_buffer_size} records"]
         if breaker_state and breaker_state != "CLOSED":
             parts.append(f"breaker={breaker_state}")
         if self.stalled:
             parts.append("STALLED")
+        if degradation:
+            parts.append(degradation.strip(", "))
         if self.proactive_signals:
             parts.append(f"signals={len(self.proactive_signals)}")
         parts.append(f"action={self.recommended_action}]")
@@ -117,6 +131,7 @@ class HealthReport:
         feedback_buffer: list[dict[str, Any]],
         analysis_ran: bool = False,
         proactive_signals: list[str] | None = None,
+        metrics: Any | None = None,
     ) -> "HealthReport":
         """Compute HealthReport from vault state.
 
@@ -127,6 +142,7 @@ class HealthReport:
             feedback_buffer: List of feedback signal dicts from vault.
             analysis_ran: True if silent analysis was triggered this call.
             proactive_signals: Optional proactive signals from pattern analysis.
+            metrics: Optional EngineMetrics for observability degradation signals.
 
         Returns:
             HealthReport with threshold checks applied.
@@ -143,6 +159,7 @@ class HealthReport:
                 recommended_action="none",
                 summary=f"Normal operation. {n} feedback records accumulated.",
                 proactive_signals=p_signals,
+                metrics=metrics,
             )
 
         # Pattern detected (>=10 records)
@@ -151,6 +168,7 @@ class HealthReport:
             analysis_ran_this_time=analysis_ran,
             pattern_detected=True,
             proactive_signals=p_signals,
+            metrics=metrics,
         )
 
         # ── Stall detection: last 3 scores flat or declining AND low quality ──

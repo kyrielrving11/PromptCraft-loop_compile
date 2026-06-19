@@ -9,6 +9,26 @@ Collect / Pattern Analysis / Skill Advisor) via the ToolRegistry. Legacy
 builder.py is still used by PromptBuildTool.
 
 Cf. Claude Code's QueryEngine vs query() separation.
+
+=== HOTSPOT OWNERSHIP (1296 lines — largest file in the project) ===
+
+Belongs here:
+  - Lifecycle orchestration: the 5 public invoke_* methods (one per mode)
+  - Mode routing: mapping user intent → tool selection
+  - Feedback pipeline: quality scoring → buffer → vault persistence → analysis trigger
+  - Vault I/O: _persist_feedback_to_vault, _run_aggregate_query, _flush_feedback_buffer
+  - Circuit breaker coordination: _guard_tool_execution, _should_break
+  - Batch processing: invoke_batch, _batch_response_to_loop
+
+Does NOT belong here (add to these files instead):
+  - Tool implementations → promptcraft-agent/tools/*.py
+  - Protocol / schema definitions → promptcraft-agent/protocol.py
+  - Execution boundary guards → promptcraft-agent/boundary.py
+  - HealthReport logic → promptcraft-agent/health_report.py
+  - Circuit breaker state machine → promptcraft-agent/circuit_breaker.py
+  - Shared context container → promptcraft-agent/context.py
+
+Tests: tests/test_engine_modes.py (19 tests for 5 invoke_* + maybe_silent_analyze)
 """
 
 from __future__ import annotations
@@ -26,7 +46,7 @@ from protocol import (
     PromptCraftResponse, SessionState, StalledResponse,
 )
 from builder import score_quality
-from context import EngineContext
+from context import EngineContext, EngineMetrics
 from health_report import compute_health, HealthReport
 from circuit_breaker import CircuitBreaker, BreakerState
 from tools import ToolRegistry, ToolResult
@@ -82,6 +102,9 @@ class PromptCraftEngine:
     # Session context — shared data container with lifecycle rules
     _ctx: EngineContext | None = field(default=None, repr=False)
 
+    # Session metrics — observability counters for silent failures
+    _metrics: EngineMetrics | None = field(default=None, repr=False)
+
     def _get_registry(self) -> ToolRegistry:
         """Lazy-init the tool registry with all five tools in priority order."""
         if self._registry is None:
@@ -105,6 +128,9 @@ class PromptCraftEngine:
             self._ctx = EngineContext(skills_dir=self.skills_dir)
         if self._breaker is None:
             self._breaker = CircuitBreaker()
+        if self._metrics is None:
+            import time as _time
+            self._metrics = EngineMetrics(session_start=_time.monotonic())
 
     def _guard_tool_execution(self, tool, request: Any) -> AgentLoopResult | None:
         """Layer 2 + Layer 5: check circuit breaker and tool permissions.
@@ -444,57 +470,115 @@ class PromptCraftEngine:
     def _persist_feedback_to_vault(self, signal: dict[str, Any]) -> None:
         """Write a feedback record to vault via checkpoint.py subprocess.
 
-        This makes feedback durable across sessions — hydrate.py --aggregate
-        can then query it for Pattern Analysis even after the session ends.
+        Buffers writes when the feedback pipeline is active — flushes every
+        EngineMetrics.FEEDBACK_FLUSH_INTERVAL records or on session end.
+        Tracks errors in EngineMetrics for HealthReport visibility.
 
-        Failure is non-blocking: if the subprocess fails (wrong cwd, missing
-        script), we silently skip persistence. The in-memory buffer still
-        works for same-session analysis.
+        Failure is non-blocking: if the subprocess fails, we track the error
+        in metrics and continue. The in-memory buffer still works for
+        same-session analysis.
         """
+        if self._metrics is None:
+            import time as _time
+            self._metrics = EngineMetrics(session_start=_time.monotonic())
+
+        # ── Buffer the signal for batched write ──
+        if not hasattr(self, '_feedback_write_buffer'):
+            self._feedback_write_buffer: list[dict[str, Any]] = []
+        self._feedback_write_buffer.append(signal)
+
+        buf_len = len(self._feedback_write_buffer)
+        if buf_len > self._metrics.feedback_buffer_max_size:
+            self._metrics.feedback_buffer_max_size = buf_len
+
+        # Flush when buffer reaches threshold
+        if buf_len >= self._metrics.FEEDBACK_FLUSH_INTERVAL:
+            self._flush_feedback_buffer()
+        # Note: remaining buffer entries are flushed by maybe_silent_analyze()
+        # at session end, ensuring no data loss.
+
+    def _flush_feedback_buffer(self) -> int:
+        """Flush buffered feedback records to vault in a single subprocess call.
+
+        Builds proper checkpoint payloads from buffer signals and writes them
+        via NDJSON batch mode. Returns the number of records successfully persisted.
+        """
+        if not hasattr(self, '_feedback_write_buffer') or not self._feedback_write_buffer:
+            return 0
+
+        records = self._feedback_write_buffer[:]
+        self._feedback_write_buffer.clear()
+        if self._metrics:
+            self._metrics.feedback_buffer_flushes += 1
+
+        # Resolve checkpoint script path (cached)
         if self._checkpoint_script is None:
-            # Resolve once: <project_root>/skills/prompt-memory/scripts/checkpoint.py
             candidate = Path("skills/prompt-memory/scripts/checkpoint.py")
             if candidate.exists():
                 self._checkpoint_script = candidate.resolve()
             else:
-                # Try relative to engine.py's location
                 engine_dir = Path(__file__).resolve().parent.parent
                 candidate = engine_dir / "skills/prompt-memory/scripts/checkpoint.py"
                 if candidate.exists():
                     self._checkpoint_script = candidate
                 else:
-                    return  # Cannot find checkpoint.py, skip persistence
+                    if self._metrics:
+                        self._metrics.vault_write_errors += len(records)
+                    return 0
 
-        payload = {
-            "task_id": signal.get("task_id", "feedback"),
-            "user_intent": signal.get("task_type", "unknown"),
-            "task_type": signal.get("task_type", ""),
-            "quality_score": signal.get("quality_score", 0),
-            "overlay_used": signal.get("overlay_used", []),
-            "skill_used": signal.get("skill_used", ""),
-            "execution_feedback": json.dumps({
-                "status": "success" if signal.get("quality_score", 0) >= 3 else "partial",
+        # Build payload for each signal record
+        payloads: list[str] = []
+        for signal in records:
+            payload = {
+                "task_id": signal.get("task_id", "feedback"),
+                "user_intent": signal.get("task_type", "unknown"),
+                "task_type": signal.get("task_type", ""),
                 "quality_score": signal.get("quality_score", 0),
-                "constraint_compliance": {
-                    "all_hard_constraints_met": not signal.get("violations"),
-                    "violations": signal.get("violations", []),
-                },
-                "output_summary": signal.get("task_type", ""),
-                "improvement_notes": signal.get("manual_fixes", ""),
-            }),
-            "tags": [signal.get("skill_used", "")] if signal.get("skill_used") else [],
-        }
+                "overlay_used": signal.get("overlay_used", []),
+                "skill_used": signal.get("skill_used", ""),
+                "execution_feedback": json.dumps({
+                    "status": "success" if signal.get("quality_score", 0) >= 3 else "partial",
+                    "quality_score": signal.get("quality_score", 0),
+                    "constraint_compliance": {
+                        "all_hard_constraints_met": not signal.get("violations"),
+                        "violations": signal.get("violations", []),
+                    },
+                    "output_summary": signal.get("task_type", ""),
+                    "improvement_notes": signal.get("manual_fixes", ""),
+                }),
+                "tags": [signal.get("skill_used", "")] if signal.get("skill_used") else [],
+            }
+            payloads.append(json.dumps(payload))
+
+        ndjson_input = "\n".join(payloads)
 
         try:
-            subprocess.run(
-                [sys.executable, str(self._checkpoint_script)],
-                input=json.dumps(payload),
+            proc = subprocess.run(
+                [
+                    sys.executable, str(self._checkpoint_script),
+                    "--batch",
+                ],
+                input=ndjson_input,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=10 + len(records) * 2,  # 10s base + 2s per record
             )
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            pass  # Non-blocking — persistence failure doesn't crash the engine
+            if proc.returncode != 0:
+                if self._metrics:
+                    self._metrics.vault_write_errors += len(records)
+            else:
+                total_bytes = len(ndjson_input.encode("utf-8"))
+                if self._metrics:
+                    self._metrics.vault_write_bytes += total_bytes
+        except subprocess.TimeoutExpired:
+            if self._metrics:
+                self._metrics.vault_write_timeouts += len(records)
+                self._metrics.subprocess_timeouts += 1
+        except (OSError, ValueError):
+            if self._metrics:
+                self._metrics.vault_write_errors += len(records)
+
+        return len(records)
 
     def _run_aggregate_query(self, min_records: int = 10) -> dict[str, Any] | None:
         """Run hydrate.py --aggregate to get cross-session Pattern Analysis data.
@@ -525,94 +609,96 @@ class PromptCraftEngine:
 
     # ── Pattern analysis trigger ──────────────────────────────────────────
 
-    def _maybe_trigger_analysis(self) -> AgentLoopResult | None:
-        """Check if the feedback buffer has enough signals for pattern analysis.
+    def _select_analysis_data(self) -> list[dict[str, Any]] | None:
+        """Select data source for pattern analysis (progressive cost model).
 
-        Data sources:
-          - Same-session: SessionState.feedback_buffer (in-memory, fast)
-          - Cross-session: hydrate.py --aggregate (vault-based, durable)
+        1. In-memory buffer (same-session, cheapest) — requires ≥10 records.
+        2. Cross-session vault aggregate (disk read, more expensive).
 
-        The in-memory buffer triggers immediate same-session analysis.
-        Cross-session aggregation requires the caller to run hydrate.py
-        --aggregate before invoking the engine, and inject results via
-        hydrate_results.
-
-        Three-tier gating:
-          - ≥10 records → Pattern Analysis (internal observation)
-          - ≥20 records + ≥65% consistency on an overlay → Skill Evolution Suggestion
-          - ≥30 records + stable task-type pattern → Skill Creation Suggestion
-
-        Returns None if thresholds not met. Returns an AgentLoopResult with
-        pattern_report or skill_advice if analysis triggered.
+        Returns list of record dicts, or None if neither source has enough data.
         """
         buffer = self.state.feedback_buffer
-
-        # ── Data source selection (progressive cost model) ──
-        # 1. In-memory buffer (same-session, cheapest)
-        # 2. hydrate.py --aggregate (cross-session, disk read)
         if len(buffer) >= 10:
-            records_for_analysis = buffer
-        else:
-            # Try cross-session aggregate from vault
-            aggregate = self._run_aggregate_query(min_records=10)
-            if aggregate and aggregate.get("results"):
-                # Convert aggregate results to record-like dicts for PatternAnalysis
-                records_for_analysis = []
-                for group in aggregate["results"]:
-                    records_for_analysis.append({
-                        "task_type": group.get("group_key", ""),
-                        "quality_score": int(group.get("avg_quality", 0)),
-                        "overlay_used": [
-                            ov.get("overlay", "")
-                            for ov in group.get("high_freq_overlays", [])
-                        ],
-                        "total_records": group.get("total_records", 0),
-                    })
-            else:
-                return None  # Not enough data from either source
+            return list(buffer)
 
-        # ── Use EngineContext — inject records into hydrate_results ──
+        aggregate = self._run_aggregate_query(min_records=10)
+        if aggregate and aggregate.get("results"):
+            records: list[dict[str, Any]] = []
+            for group in aggregate["results"]:
+                records.append({
+                    "task_type": group.get("group_key", ""),
+                    "quality_score": int(group.get("avg_quality", 0)),
+                    "overlay_used": [
+                        ov.get("overlay", "")
+                        for ov in group.get("high_freq_overlays", [])
+                    ],
+                    "total_records": group.get("total_records", 0),
+                })
+            return records
+        return None
+
+    def _run_pattern_analysis(
+        self, records: list[dict[str, Any]]
+    ) -> AgentLoopResult | None:
+        """Run PatternAnalysisTool against the given records.
+
+        Populates ctx.pattern_report and ctx.proactive_signals on success.
+        Returns AgentLoopResult or None.
+        """
         if self._ctx is None:
             self._ctx = EngineContext(skills_dir=self.skills_dir)
         if self._ctx.hydrate_results is None:
             self._ctx.hydrate_results = {}
-        self._ctx.hydrate_results["results"] = records_for_analysis
+        self._ctx.hydrate_results["results"] = records
 
         registry = self._get_registry()
-
-        # ── Step 1: Pattern Analysis ──
         pattern_tool = registry.get("pattern_analysis")
-        if pattern_tool:
-            pattern_result = pattern_tool.call(None, self._ctx)
-            if pattern_result.ok and pattern_result.data:
-                self.state.analysis_count += 1
-                self.state.continue_reason = ContinueReason.PATTERN_READY
+        if pattern_tool is None:
+            return None
 
-                # Store pattern_report + proactive_signals in context
-                from protocol import PatternReport
-                self._ctx.pattern_report = PatternReport(
-                    total_executions=pattern_result.data.get("total_executions", 0),
-                    high_freq_overlays=pattern_result.data.get("high_freq_overlays", []),
-                    missing_constraints=pattern_result.data.get("missing_constraints", []),
-                    low_quality_task_types=pattern_result.data.get("low_quality_task_types", []),
-                    summary=pattern_result.data.get("summary", ""),
-                )
-                self._ctx.proactive_signals = pattern_result.data.get("proactive_signals", [])
+        pattern_result = pattern_tool.call(None, self._ctx)
+        if not (pattern_result.ok and pattern_result.data):
+            return None
 
-                # ── Step 2: SkillAdvisor reads pattern_report from context ──
-                advisor_tool = registry.get("skill_advisor")
-                if advisor_tool:
-                    advisor_result = advisor_tool.call(None, self._ctx)
-                    if advisor_result.ok and advisor_result.data:
-                        advice_list = advisor_result.data.get("advice", [])
-                        if advice_list:
-                            self.state.continue_reason = ContinueReason.EVOLUTION_SUGGESTED
-                            return self._tool_result_to_loop(advisor_result, "skill_advisor")
+        self.state.analysis_count += 1
+        self.state.continue_reason = ContinueReason.PATTERN_READY
 
-                # Return pattern report even if no advisor-level advice yet
-                return self._tool_result_to_loop(pattern_result, "pattern_analysis")
+        from protocol import PatternReport
+        self._ctx.pattern_report = PatternReport(
+            total_executions=pattern_result.data.get("total_executions", 0),
+            high_freq_overlays=pattern_result.data.get("high_freq_overlays", []),
+            missing_constraints=pattern_result.data.get("missing_constraints", []),
+            low_quality_task_types=pattern_result.data.get("low_quality_task_types", []),
+            summary=pattern_result.data.get("summary", ""),
+        )
+        self._ctx.proactive_signals = pattern_result.data.get("proactive_signals", [])
 
-        return None
+        # Try SkillAdvisor as a follow-up
+        advisor_tool = registry.get("skill_advisor")
+        if advisor_tool:
+            advisor_result = advisor_tool.call(None, self._ctx)
+            if advisor_result.ok and advisor_result.data:
+                advice_list = advisor_result.data.get("advice", [])
+                if advice_list:
+                    self.state.continue_reason = ContinueReason.EVOLUTION_SUGGESTED
+                    return self._tool_result_to_loop(advisor_result, "skill_advisor")
+
+        return self._tool_result_to_loop(pattern_result, "pattern_analysis")
+
+    def _maybe_trigger_analysis(self) -> AgentLoopResult | None:
+        """Check if enough feedback signals exist for pattern analysis.
+
+        Three-tier gating:
+          - ≥10 records → Pattern Analysis (internal observation)
+          - ≥20 records + ≥65% consistency → Skill Evolution Suggestion
+          - ≥30 records + stable pattern → Skill Creation Suggestion
+
+        Returns None if thresholds not met, or AgentLoopResult if triggered.
+        """
+        records = self._select_analysis_data()
+        if records is None:
+            return None
+        return self._run_pattern_analysis(records)
 
     # ── Silent analysis ─────────────────────────────────────────────────────
 
@@ -635,17 +721,28 @@ class PromptCraftEngine:
         buffer = self.state.feedback_buffer
         analysis_ran = False
 
+        # ── Flush any remaining buffered feedback before analysis ──
+        if hasattr(self, '_feedback_write_buffer') and self._feedback_write_buffer:
+            self._flush_feedback_buffer()
+
         # Run analysis if threshold met
         if len(buffer) >= 10:
             try:
                 self._maybe_trigger_analysis()  # Side effects only
                 analysis_ran = True
             except Exception:
-                pass  # Silent means silent — never crash the caller
+                if self._metrics:
+                    self._metrics.silent_analysis_errors += 1
 
         # Compute health from feedback buffer (uses the richer HealthReport.compute)
         proactive = self._ctx.proactive_signals if self._ctx else []
-        return HealthReport.compute(buffer, analysis_ran=analysis_ran, proactive_signals=proactive)
+        metrics = self._metrics
+        return HealthReport.compute(
+            buffer,
+            analysis_ran=analysis_ran,
+            proactive_signals=proactive,
+            metrics=metrics,
+        )
 
     # ── Overlay (public) ────────────────────────────────────────────────────
 
@@ -901,6 +998,9 @@ class PromptCraftEngine:
             self._ctx = EngineContext(skills_dir=self.skills_dir)
         if self._breaker is None:
             self._breaker = CircuitBreaker()
+        if self._metrics is None:
+            import time as _time
+            self._metrics = EngineMetrics(session_start=_time.monotonic())
         cache_key = f"batch:{request.task_id or 'batch'}"
         if hydrate_results is not None:
             if not self._ctx.is_hydrate_fresh(cache_key):

@@ -8,9 +8,9 @@ and skills: generation, personalisation, execution feedback, pattern analysis,
 and evolution suggestions — backed by a persistent vault that improves across
 sessions and projects.
 
-> **v2.5** — Sub-agent architecture with 6 modes, 5-layer execution boundary,
+> **v2.6** — Sub-agent architecture with 6 modes, 5-layer execution boundary,
 > dual-storage vault, batch processing, proactive signals, vault-hydrate
-> preflight gating, and 181 tests. Python stdlib only.
+> preflight gating, query expansion, vault pruning, engine metrics, and 182 tests. Python stdlib only.
 
 ---
 
@@ -53,32 +53,24 @@ and `proactive_signals` — vault context hints (similar tasks, common pitfalls)
 
 ## Quick Start
 
+Deploy PromptCraft as a Claude Code sub-agent in your project:
+
 ```bash
-# 0. Cheap preflight — check vault for relevant history (no LLM cost)
-python skills/prompt-memory/scripts/hydrate.py --query "audit security" --top 3
+# 1. Copy the 3 core directories into your project
+cp -r promptcraft-agent/ skills/ .claude/ <your-project>/
 
-# 1. Build a prompt (no matching Skill, or high-risk task)
-echo '{"task":"audit ERC20 token","mode":"build"}' \
+# 2. Initialize the vault
+cd <your-project>
+echo '{"task_id":"init","user_intent":"promptcraft initialized"}' \
+  | python skills/prompt-memory/scripts/checkpoint.py
+
+# 3. Verify — the sub-agent auto-registers via .claude/agents/promptcraft.md
+echo '{"task":"write a hello function","mode":"build"}' \
   | python promptcraft-agent/subagent_adapter.py
-
-# 2. Personalise a Skill (matching Skill + vault history found)
-echo '{"task":"audit contract","mode":"overlay","skill_name":"solidity-audit"}' \
-  | python promptcraft-agent/subagent_adapter.py
-
-# 3. Record execution feedback
-echo '{"task":"audit contract","mode":"feedback","feedback":{"output":"...","success":true}}' \
-  | python promptcraft-agent/subagent_adapter.py
-
-# 4. Batch-process multiple tasks
-echo '{"mode":"batch","items":[{"task":"audit token","skill_name":"solidity-audit"},{"task":"write docs"}]}' \
-  | python promptcraft-agent/subagent_adapter.py
-
-# Vault I/O (standalone)
-echo '{"task_id":"org-standard","user_intent":"all contracts must pass Certora"}' \
-  | python skills/prompt-memory/scripts/checkpoint.py --global
-
-python skills/prompt-memory/scripts/hydrate.py --query "audit security"
 ```
+
+The sub-agent is now available as `promptcraft` in Claude Code. Trigger it
+explicitly or let the `promptcraft-bridge` skill auto-invoke it for complex tasks.
 
 ## Execution Boundary (5-Layer Defence-in-Depth)
 
@@ -128,12 +120,12 @@ PromptCraft/
 │   └── promptcraft-bridge/    # Trigger-only Skill → sub-agent delegation
 │       └── references/        #   when-to-invoke heuristics
 ├── tests/
-│   ├── test_scripts.py        # 48 tests (checkpoint, hydrate, federation)
-│   ├── test_health_report.py  # 31 tests (thresholds, stall, consistency, proactive)
-│   ├── test_subagent_adapter.py # 16 tests (routing, parsing, batch, E2E)
-│   ├── test_engine_modes.py   # 19 tests (5 invoke_* + silent analyze + batch)
-│   ├── test_integration.py    # 10 tests (full closed-loop workflows)
-│   └── test_boundary.py       # 57 tests (5-layer guards, breaker, tools, batch input)
+│   ├── test_scripts.py        # checkpoint, hydrate, federation, freshness
+│   ├── test_health_report.py  # thresholds, stall, consistency, proactive
+│   ├── test_subagent_adapter.py # routing, parsing, batch, E2E
+│   ├── test_engine_modes.py   # 5 invoke_* + silent analyze + batch
+│   ├── test_integration.py    # full closed-loop workflows
+│   └── test_boundary.py       # 5-layer guards, breaker, tools, batch input
 ├── .claude/agents/            # Sub-agent registration
 ├── CLAUDE.md                  # Project conventions
 └── README.md / README.zh-CN.md
@@ -153,8 +145,15 @@ PromptCraft/
   denial tracking and automatic cooldown
 - **Multi-Project Federation**: Two-tier vault — global (`~/.promptcraft/`)
   + project (`./.promptcraft/`)
-- **Query Expansion**: LLM-generated cross-language keywords before Jaccard
-  search (zero-code)
+- **Query Expansion**: Synonym-based query expansion with cross-language
+  (CJK→EN) mapping before Jaccard search (zero-dependency)
+- **Batch Feedback Persistence**: Buffered vault writes — feedback records
+  accumulate in-memory and flush to vault in batches (NDJSON), reducing
+  subprocess overhead
+- **Engine Metrics**: Observable silent-failure counters (vault write errors,
+  subprocess timeouts, analysis errors) surfaced via HealthReport degradation
+- **Vault Pruning**: `hydrate.py --prune --older-than N` for stale entry
+  cleanup — GLOBAL entries never pruned, `.md` files preserved
 - **Execution Feedback Loop**: Structured quality scoring (1-5) written back
   to vault after every execution
 - **Health Report**: Compact one-line signal — `[PC: N records, action=...]` —

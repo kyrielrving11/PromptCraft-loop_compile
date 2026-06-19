@@ -3,38 +3,35 @@
 This is the PromptCraft repository — a suite of prompt-engineering tools
 for AI coding agents (CodeBuddy / Codex / Claude Code).
 
-**Version:** v2.5 | **Tests:** 181 passing | **Python:** stdlib only
+**Version:** v2.6 | **Tests:** 182 passing | **Python:** stdlib only
 
 ## Quick Start
 
+Deploy PromptCraft as a Claude Code sub-agent in your project:
+
 ```bash
-# Run all tests
-python tests/test_scripts.py
+# 1. Copy the 3 core directories into your project
+cp -r promptcraft-agent/ skills/ .claude/ <your-project>/
 
-# Create a test vault
-echo '{"task_id":"test","user_intent":"test save"}' | python skills/prompt-memory/scripts/checkpoint.py
+# 2. Initialize the vault
+cd <your-project>
+echo '{"task_id":"init","user_intent":"promptcraft initialized"}' \
+  | python skills/prompt-memory/scripts/checkpoint.py
 
-# Search vault (auto-merges global + project)
-python skills/prompt-memory/scripts/hydrate.py --query "test save"
-
-# Save to global vault (cross-project)
-echo '{"task_id":"org-standard","user_intent":"all contracts must pass Certora"}' | \
-  python skills/prompt-memory/scripts/checkpoint.py --global
+# 3. Verify — the sub-agent auto-registers via .claude/agents/promptcraft.md
+echo '{"task":"write a hello function","mode":"build"}' \
+  | python promptcraft-agent/subagent_adapter.py
 ```
 
 ## Project Layout
 
 ```
 skills/
-├── prompt-craft/          # Core 6-step workflow (SKILL.md)
-│   └── references/        # routing-matrix, build-checklist
 ├── prompt-memory/         # Dual-storage vault I/O + federation
 │   ├── scripts/           # checkpoint.py, hydrate.py
 │   └── references/        # vault-schema (incl. federation + feedback schemas)
 ├── prompt-techniques/     # Reference catalog of 7 techniques (SKILL.md)
 │   └── references/        # zero-shot, few-shot, cot, step-back, least-to-most, tot
-├── prompt-review/         # Quality audit with technique-specific checks (SKILL.md)
-│   └── references/        # review-checklist
 └── promptcraft-bridge/    # Trigger-only wrapper → PromptCraft sub-agent (SKILL.md)
     └── references/        # when-to-invoke.md — heuristics for triggering
 promptcraft-agent/
@@ -57,24 +54,25 @@ promptcraft-agent/
     └── skill_advisor.py   # Evolution/creation suggestions
 .claude/agents/
 └── promptcraft.md         # Sub-agent registration
-docs/
-└── AGENT_ARCHITECTURE.md  # Full plan for evolving to Sub-Agent model
 tests/
-├── test_scripts.py           # 48 unit tests (checkpoint, hydrate, federation)
-├── test_health_report.py     # 26 tests (thresholds, stall, consistency, compact_str)
-├── test_subagent_adapter.py  # 16 tests (routing, parsing, formatting, E2E)
-├── test_engine_modes.py      # 19 tests (5 invoke_* + maybe_silent_analyze)
-├── test_integration.py       # 12 tests (full closed-loop workflows)
-└── test_boundary.py          # 52 tests (5-layer guards, circuit breaker, tool safety)
+├── test_scripts.py           # checkpoint, hydrate, federation
+├── test_health_report.py     # thresholds, stall, consistency, compact_str
+├── test_subagent_adapter.py  # routing, parsing, formatting, E2E
+├── test_engine_modes.py      # 5 invoke_* + maybe_silent_analyze
+├── test_integration.py       # full closed-loop workflows
+└── test_boundary.py          # 5-layer guards, circuit breaker, tool safety
 ```
 
-## Key Features (v2.4)
+## Key Features (v2.6)
 
 - **Execution Boundary Module**: 5-layer defence-in-depth for the sub-agent: Input → Tool → Vault → Output → Circuit Breaker. Adapted from Claude Code's 7-layer permission system for a sub-agent whose threat model is knowledge pollution and trust-chain abuse, not shell injection.
 - **Batch Processing**: Process multiple tasks in a single PromptCraft call — hydrate once, group by Skill match, execute in parallel (max 4 workers), aggregate results.
+- **Batch Feedback Persistence**: Buffered vault writes — feedback records accumulate in-memory and flush to vault in batches (NDJSON), reducing subprocess overhead.
+- **Engine Metrics**: Observable silent-failure counters (vault write errors, subprocess timeouts, analysis errors) surfaced via HealthReport degradation signals.
 - **Proactive Health Signals**: Every response includes `proactive_signals` — vault context hints (similar tasks, common pitfalls) without changing the passive-trigger model.
 - **Multi-Project Federation**: Two-tier vault — global (`~/.promptcraft/`) + project (`./.promptcraft/`)
-- **Query Expansion**: LLM-generated cross-language keywords before Jaccard search (zero-code)
+- **Query Expansion**: Synonym-based query expansion with cross-language (CJK→EN) mapping before Jaccard search (zero-dependency)
+- **Vault Pruning**: `hydrate.py --prune --older-than N` for stale entry cleanup — GLOBAL entries never pruned, .md files preserved
 - **Execution Feedback Loop**: Structured quality scoring (1-5) written back to vault
 - **GLOBAL Entry Injection**: GLOBAL entries always returned regardless of query match
 - **Multi-Script Tokenizer**: CJK + Japanese Kana + Korean Hangul + Latin + Cyrillic
@@ -83,6 +81,7 @@ tests/
 
 - Vault entries are append-only. New versions use `checkpoint.py --version-of`.
 - Script output is always JSON to stdout. Errors use `{"status": "error", ...}`.
+- Verify all changes with: `python -m unittest discover -s tests -p "test_*.py"`
 - `importance: GLOBAL` entries are always returned by hydrate.py — inject their
   constraints unconditionally into every session.
 - Execution feedback uses `importance: REFERENCE` — consultable but not auto-injected.
@@ -92,6 +91,9 @@ tests/
 - Use `checkpoint.py --global` for cross-project entries; `hydrate.py --no-global` to opt out.
 - Execution boundary is FAIL-CLOSED: guards deny when uncertain. MODIFIES_SKILLS is bypass-immune hard-deny for all tools.
 - Circuit breaker trips after 3 consecutive denials (OPEN), probes after cooldown (HALF_OPEN), resets on success (CLOSED).
+- Low-quality counter has 60-second time-based decay — prevents oscillation between scores 2-3 from never resetting.
+- `checkpoint.py --batch` reads NDJSON (one JSON per line) for efficient multi-record writes.
+- `hydrate.py --prune --older-than N` cleans stale entries; `--dry-run` previews without modifying.
 
 ## PromptCraft Sub-Agent (v2.2)
 
