@@ -1,4 +1,4 @@
-"""PromptCraft Agent — Sub-agent adapter (unified entry point).
+"""PromptCraft-loop_compile — Sub-agent adapter (unified entry point).
 
 This is the single entry point when PromptCraft is invoked as a Claude Code
 sub-agent via `Agent(subagent_type="promptcraft", ...)`. It wraps the Engine,
@@ -9,17 +9,17 @@ Design (from subagent-orchestration-plan.md):
     - Internal process is invisible — only the final result is returned
     - Health Report is the only signal mechanism
 
-Five modes:
-    overlay  — Skill personalisation (skill_name must be set)
-    build    — Full 8-section prompt generation (fallback, no matching Skill)
-    feedback — Record execution results
-    analyze  — Pattern analysis on accumulated feedback
-    advise   — Skill evolution/creation suggestions
+Three modes (v3.4):
+    loop_compile — Per-iteration prompt compiler (primary entry point)
+    feedback     — Record execution results → quality scoring → vault persistence
+    review       — Audit prompt quality (structural checks + constraint compliance)
+
+build is an internal path (loop_compile L2 delegation) — not an exposed mode.
 
 Usage:
     from subagent_adapter import handle
 
-    result_json = handle('{"task":"...","mode":"build"}')
+    result_json = handle('{"task":"...","mode":"loop_compile","loop_id":"t","round":1}')
     # Returns compact JSON with health report header + result body.
 """
 
@@ -32,24 +32,15 @@ from protocol import (
     AgentLoopResult, AgentStatus, Mode, PromptCraftRequest, to_dict,
 )
 from engine import PromptCraftEngine, create_engine
-from boundary import guard_input, guard_output
 
 
-# ── Mode mapping (sub-agent mode → engine Mode) ────────────────────────────────
+# ── Mode mapping (v3.4: 3 external + 1 internal) ──────────────────────────────
 
-# Sub-agent "build" maps to engine Mode.FULL (full pipeline)
 MODE_MAP: dict[str, Mode] = {
-    "overlay":  Mode.OVERLAY,
-    "build":    Mode.FULL,
-    "feedback": Mode.FEEDBACK,
-    "analyze":  Mode.ANALYZE,
-    "advise":   Mode.ADVISE,
-    # Legacy modes pass through directly
-    "full":     Mode.FULL,
-    "quick":    Mode.QUICK,
-    "review":   Mode.REVIEW,
-    # Phase 5: batch processing
-    "batch":    Mode.BATCH,
+    "loop_compile": Mode.LOOP_COMPILE,
+    "feedback":     Mode.FEEDBACK,
+    "review":       Mode.REVIEW,
+    "build":        Mode.BUILD,       # Internal: loop_compile L2 delegation
 }
 
 
@@ -87,51 +78,28 @@ def handle(
     else:
         raise TypeError(f"Expected str, dict, or PromptCraftRequest; got {type(request_input).__name__}")
 
-    # ── BATCH: early return — different input/output contract ──
-    if raw_mode == "batch" and raw_data is not None:
-        from protocol import BatchRequest, BatchItem
-        items_data = raw_data.get("items", []) if isinstance(raw_data, dict) else []
-        from boundary import guard_batch_input
-        batch_guard = guard_batch_input(items_data)
-        if not batch_guard.ok:
-            return json.dumps({
-                "health": "[PromptCraft] records=0 quality=0.0",
-                "status": "error",
-                "result": {"mode": "batch", "error": batch_guard.reason},
-            }, indent=2, ensure_ascii=False)
-
-        batch_req = BatchRequest(
-            items=[BatchItem(**item) for item in items_data] if items_data else [],
-            task_id=raw_data.get("task_id") if isinstance(raw_data, dict) else None,
-        )
-        if engine is None:
-            engine = create_engine()
-        batch_response = engine.invoke_batch(batch_req)
-        loop_result = engine._batch_response_to_loop(batch_response)
-        health = engine.maybe_silent_analyze()
-        return _build_agent_response(loop_result, health, "batch")
-
     # ── Non-batch: parse into PromptCraftRequest ──
     if raw_data is not None:
         request = _parse_request(raw_data)
 
     # ── Normalise mode for engine ──
-    engine_mode = MODE_MAP.get(raw_mode, Mode.FULL)
+    engine_mode = MODE_MAP.get(raw_mode)
+    if engine_mode is None:
+        return json.dumps({
+            "health": "[PC: 0 records, normal]",
+            "status": "error",
+            "result": {"mode": raw_mode, "error": f"Unknown mode: {raw_mode}"},
+        }, indent=2, ensure_ascii=False)
     if raw_data is not None:
         request.mode = engine_mode
 
-    # ── Layer 1: Input boundary ──
-    input_guard = guard_input(
-        task=request.task or "",
-        mode=raw_mode,
-        skill_name=getattr(request, "skill_name", None),
-        feedback_present=request.feedback is not None,
-    )
-    if not input_guard.ok:
+    # ── Inline input validation (v3.4: replaces boundary.guard_input) ──
+    task = getattr(request, 'task', '') or ''
+    if not task.strip():
         return json.dumps({
-            "health": "[PromptCraft] records=0 quality=0.0",
+            "health": "[PC: 0 records, normal]",
             "status": "error",
-            "result": {"mode": raw_mode, "error": input_guard.reason},
+            "result": {"mode": raw_mode, "error": "Task is required."},
         }, indent=2, ensure_ascii=False)
 
     # ── Initialise engine ──
@@ -142,11 +110,11 @@ def handle(
     # ── Execute via dedicated engine method ──
     result = _route_to_engine(engine, request)
 
-    # ── Silent analysis after every mode (returns HealthReport) ──
-    health = engine.maybe_silent_analyze()
+    # ── Build compact health line (v3.4: replaces HealthReport) ──
+    health_line = _compact_health(engine)
 
     # ── Build and return response ──
-    return _build_agent_response(result, health, raw_mode)
+    return _build_agent_response(result, health_line, raw_mode)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -155,30 +123,22 @@ def _route_to_engine(
     engine: PromptCraftEngine,
     request: PromptCraftRequest,
 ) -> AgentLoopResult:
-    """Route request to the appropriate dedicated engine method.
-
-    Uses the 6 public invoke_* methods. Falls back to engine.invoke()
-    for legacy modes (REVIEW) or unknown modes.
-    """
+    """Route request to the appropriate engine method (v3.4: 3-mode + build)."""
     mode = request.mode
 
-    if mode == Mode.OVERLAY:
-        return engine.invoke_overlay(request)
-
-    if mode == Mode.ANALYZE:
-        return engine.invoke_analyze(request)
-
-    if mode == Mode.ADVISE:
-        return engine.invoke_advise(request)
-
+    if mode == Mode.LOOP_COMPILE:
+        return engine.invoke_loop_compile(request)
     if mode == Mode.FEEDBACK:
         return engine.invoke_feedback(request)
-
-    if mode in (Mode.FULL, Mode.QUICK):
+    if mode == Mode.REVIEW:
+        return engine._handle_review(request, None)
+    if mode == Mode.BUILD:
         return engine.invoke_build(request)
 
-    # Legacy / unknown: fall back to generic invoke()
-    return engine.invoke(request)
+    return AgentLoopResult(
+        status=AgentStatus.ERROR,
+        response=None,
+    )
 
 
 def _parse_request(
@@ -199,36 +159,63 @@ def _parse_request(
         raise TypeError(f"Expected str, dict, or PromptCraftRequest; got {type(raw).__name__}")
 
     # Normalise mode string → Mode enum (mapping happens in handle())
-    mode = data.get("mode", "full")
+    mode = data.get("mode", "build")
     if isinstance(mode, str):
         valid_modes = {m.value for m in Mode}
-        data["mode"] = Mode(mode) if mode in valid_modes else Mode.FULL
+        data["mode"] = Mode(mode) if mode in valid_modes else Mode.BUILD
     elif not isinstance(mode, Mode):
-        data["mode"] = Mode.FULL
+        data["mode"] = Mode.BUILD
 
-    return PromptCraftRequest(**data)
+    # Filter to known PromptCraftRequest fields, attach extras as attributes.
+    # loop_compile mode sends fields (loop_id, round, goal_id, etc.) that
+    # PromptCraftRequest doesn't accept — these are read by engine via getattr().
+    from dataclasses import fields as dc_fields
+    known = {f.name for f in dc_fields(PromptCraftRequest)}
+    filtered = {k: v for k, v in data.items() if k in known}
+    extras = {k: v for k, v in data.items() if k not in known}
+
+    req = PromptCraftRequest(**filtered)
+    for k, v in extras.items():
+        setattr(req, k, v)
+    return req
+
+
+def _compact_health(engine: PromptCraftEngine) -> str:
+    """Build compact health line with silent-failure metrics when degraded.
+
+    Format: [PC: N records, normal] or [PC: N records, STALLED, write_err=3]
+    Appends error counters only when non-zero — keeps normal lines short.
+    """
+    record_count = len(engine.state.quality_trend) if engine.state else 0
+    stalled = engine._should_break() if engine.state else False
+    status = "STALLED" if stalled else "normal"
+
+    parts = [f"PC: {record_count} records", status]
+
+    # Surface silent-failure counters when non-zero (v3.5.2)
+    m = engine._metrics
+    if m:
+        if m.vault_write_errors:
+            parts.append(f"write_err={m.vault_write_errors}")
+        if m.vault_write_timeouts:
+            parts.append(f"write_timeout={m.vault_write_timeouts}")
+        if m.subprocess_timeouts:
+            parts.append(f"sub_timeout={m.subprocess_timeouts}")
+        if m.hydrate_cache_misses:
+            parts.append(f"cache_miss={m.hydrate_cache_misses}")
+
+    return "[" + ", ".join(parts) + "]"
 
 
 def _build_agent_response(
     result: AgentLoopResult,
-    health: Any,  # HealthReport
+    health_line: str,
     mode: str = "",
 ) -> str:
-    """Build the compact JSON response the main agent sees.
-
-    Uses SubagentOutput as the unified schema. The main agent reads:
-      - health.compact_line() — one-line status signal
-      - mode — which mode produced this output
-      - prompt_or_overlay — the actual payload (prompt, overlay, or None)
-      - analysis — PatternReport or SkillAdvice (only for analyze/advise modes)
-      - technique_used — which technique was selected (build mode)
-      - confidence — 0-1 confidence score
-    """
-    # Extract prompt text from whichever result field is populated
+    """Build the compact JSON response the main agent sees (v3.4)."""
     prompt_or_overlay: str | None = None
     analysis: dict[str, Any] | None = None
     technique_used: str | None = None
-    confidence: float = 0.0
 
     if result.response is not None:
         r = result.response
@@ -237,44 +224,21 @@ def _build_agent_response(
             analysis = to_dict(r.analysis)
             technique_used = r.analysis.technique if hasattr(r.analysis, "technique") else None
 
-    if result.feedback is not None:
-        fb = result.feedback
-        prompt_or_overlay = (
-            f"Quality: {fb.quality_score}/5. {fb.improvement_notes}"
-            if fb.improvement_notes else f"Quality: {fb.quality_score}/5."
-        )
+    effective_mode = mode or "unknown"
 
-    if result.stalled is not None:
-        prompt_or_overlay = result.stalled.question_for_main_agent
-        confidence = 0.3  # Low confidence when stalled
+    # Inline output size guard (v3.4: replaces boundary.guard_output)
+    prompt_text = prompt_or_overlay or ""
+    if len(prompt_text) > 32_000:
+        prompt_text = prompt_text[:32_000] + "\n\n[truncated — exceeds 32KB]"
 
-    # Determine effective mode
-    effective_mode = mode or (
-        "stalled" if result.status.value == "stalled" else "unknown"
-    )
-
-    # Build SubagentOutput
     payload = {
         "mode": effective_mode,
-        "prompt_or_overlay": prompt_or_overlay,
+        "prompt_or_overlay": prompt_text,
         "analysis": analysis,
         "technique_used": technique_used,
-        "confidence": confidence,
-        "proactive_signals": (
-            health.proactive_signals
-            if hasattr(health, 'proactive_signals') and health.proactive_signals
-            else []
-        ),
+        "confidence": 0.0,
+        "proactive_signals": [],
     }
-
-    # ── Layer 4: Output boundary ──
-    output_guard = guard_output(
-        payload,
-        health_report=health.compact_line() if hasattr(health, 'compact_line') else str(health),
-    )
-    health_line = health.compact_line() if hasattr(health, 'compact_line') else str(health)
-    if output_guard.warnings:
-        health_line += " [warn: " + "; ".join(output_guard.warnings) + "]"
 
     output = {
         "health": health_line,

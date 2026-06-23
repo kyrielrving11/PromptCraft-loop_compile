@@ -1,194 +1,141 @@
-# PromptCraft
+# PromptCraft-loop_compile
 
 [中文文档](README.zh-CN.md)
 
-PromptCraft is a **prompt-engineering sub-agent** for AI coding agents
-(Claude Code / Codex / CodeBuddy). It manages the full lifecycle of prompts
-and skills: generation, personalisation, execution feedback, pattern analysis,
-and evolution suggestions — backed by a persistent vault that improves across
-sessions and projects.
+PromptCraft-loop_compile is a **Loop-Time Intelligence Layer** for AI coding agents
+(Claude Code / Codex / CodeBuddy). Its primary job: compile per-iteration prompts
+for long-running agent loops — with structured memory, constraint inheritance,
+drift correction, and incremental recompilation (L0/L1/L2).
 
-> **v2.8** — LLM-driven prompt generation: Python selects the technique,
-> the LLM sub-agent reads the technique reference and generates the prompt.
-> 4-engine tool system, 5-layer execution boundary, 178 tests. Python stdlib only.
+> **v3.5.1** — 3-mode interface. 8 core mechanisms. Vault-backed cross-round memory.
+> Constraint retirement, rolling summary, adaptive technique routing.
+> 186 tests. Python stdlib only.
 
 ---
+
+## Core Concept
+
+```
+Loop Runtime (Claude Code /loop, cron, etc.)
+  │
+  ├─ Round N:   call PromptCraft loop_compile → get compiled prompt → execute → feedback
+  ├─ Round N+1: call PromptCraft loop_compile (reads vault, patches or rebuilds) → execute
+  └─ ...
+
+PromptCraft is NOT the Loop Runtime. It is the intelligence layer that the
+Runtime calls when it needs a prompt that knows what happened last round.
+```
+
+## 3 Modes
+
+| Mode | Trigger | Returns |
+|------|---------|---------|
+| **loop_compile** | Every agent loop iteration | Compiled prompt + recompile_level (L0/L1/L2) + loop_objective + loop_health + task_alignment |
+| **feedback** | After execution | Quality score → vault persistence |
+| **review** | Audit prompt quality | Review report with structural checks |
+
+`build` is an internal path (loop_compile L2 delegates to `builder.py` for technique routing) — not an exposed mode.
+
+## Recompile Levels
+
+| Level | Trigger | What Happens |
+|-------|---------|--------------|
+| **L0 Fast Path** | goal_id unchanged, no new failures/constraints | Reuse actual cached prompt from Markdown (not placeholder) |
+| **L1 Patch** | New constraints, failures, or repair signals | Patch previous prompt with deltas; auto-retires stale constraints |
+| **L2 Full Recompile** | Round 1, goal_id changed, plan_source, strategy collapse | Full hydrate + adaptive route + rolling summary + build |
+
+**Hard Gates** (can change compile level): force_level override, first-call/plan_source, goal_id change, explicit failure/constraint.
+
+**Soft Advisories** (warnings only, never block): task alignment vs Loop Objective, loop health (drift, constraint integrity, strategy stability), repair cue detection, forward hints from vault.
+
+**v3.5 additions**: L1 auto-retires constraints silent for 3+ rounds; L1/L2 inject rolling summary (quality trajectory, recurring issues, key lessons from last 5 rounds); L2 uses adaptive technique routing (quality-driven fallback from keyword default).
+
+## Quick Start
+
+```bash
+# 1. Copy core directories into your project
+cp -r loop-compiler/ skills/ .claude/ <your-project>/
+
+# 2. Initialize vault
+cd <your-project>
+echo '{"task_id":"init","user_intent":"promptcraft initialized"}' \
+  | python skills/prompt-memory/scripts/checkpoint.py
+
+# 3. Primary: loop_compile
+echo '{"mode":"loop_compile","loop_id":"test","round":1,"goal_id":"audit-erc20","task":"Audit ERC20 token for security vulnerabilities"}' \
+  | python loop-compiler/subagent_adapter.py
+
+# 4. Feedback
+echo '{"task":"audit contract","mode":"feedback","feedback":{"output":"done","success":true}}' \
+  | python loop-compiler/subagent_adapter.py
+```
 
 ## Architecture
 
 ```
 Main Agent (Claude Code / Codex)
   │
-  └─ PromptCraft Sub-Agent (LLM — isolated context)
+  └─ PromptCraft Sub-Agent
         │
-        ├─ Python layer (data & safety)
-        │   ├─ builder.py           ← technique router (keyword heuristic)
-        │   ├─ engine.py            ← lifecycle + vault I/O + circuit breaker
-        │   ├─ boundary.py          ← 5-layer defence-in-depth
-        │   └─ tools/               ← pattern_analysis / skill_advisor
-        │
-        └─ LLM layer (generation)
-            ├─ Read technique reference .md
-            ├─ Generate structured prompt (adaptive sections)
-            └─ Generate Skill overlay
+        └─ Python layer (pure function + lifecycle)
+            ├─ loop_compiler.py    ← decide_level + advisories + L0/L1/L2
+            ├─ builder.py          ← technique router (keyword + adaptive) + quality scoring
+            ├─ engine.py           ← lifecycle + vault I/O + circuit breaker + YAML dual-write + feedback backfill
+            ├─ protocol.py         ← I/O schemas (19 types)
+            └─ subagent_adapter.py ← unified entry point, 3-mode routing
 ```
 
-**Design:** Python handles classification + data + safety. The LLM handles
-creative prompt writing — it reads technique reference files and applies
-them to the task. This split keeps Python lean (no string-template prompt
-generation) and lets the LLM do what it does best.
+## Key Features (v3.5)
 
-## Six Modes
-
-| Mode | Trigger | Returns |
-|------|---------|---------|
-| **build** | No Skill + high-risk task | Technique selection → LLM reads reference → generates structured prompt |
-| **overlay** | Matching Skill + vault history | Domain-filtered constraints → LLM generates overlay for Skill |
-| **feedback** | After execution | Quality score + improvement notes |
-| **analyze** | Health report signals `->analyze` | Pattern report from accumulated data |
-| **advise** | Health report signals `->advise` | Skill evolution/creation suggestions |
-| **batch** | Multiple tasks | BatchSummary + per-item results |
-
-**Build/Overlay flow**: Python pre-processor selects technique + gathers vault
-context → LLM sub-agent reads the technique reference file → LLM generates
-the complete prompt/overlay → checkpoint to vault → return to main agent.
-
-**Feedback/Analyze/Advise flow**: Python handles everything (data processing).
-
-Every response includes a compact **Health Report**: `[PC: 5 records | hint: similar→solidity-audit q=4.2, normal]`
-— vault hints are available even below the 10-record analysis threshold.
-
-## Quick Start
-
-Deploy PromptCraft as a Claude Code sub-agent in your project:
-
-```bash
-# 1. Copy the 3 core directories into your project
-cp -r promptcraft-agent/ skills/ .claude/ <your-project>/
-
-# 2. Initialize the vault
-cd <your-project>
-echo '{"task_id":"init","user_intent":"promptcraft initialized"}' \
-  | python skills/prompt-memory/scripts/checkpoint.py
-
-# 3. Verify — the sub-agent auto-registers via .claude/agents/promptcraft.md
-echo '{"task":"write a hello function","mode":"build"}' \
-  | python promptcraft-agent/subagent_adapter.py
-```
-
-The sub-agent is now available as `promptcraft` in Claude Code. Auto-trigger
-rules in CLAUDE.md handle invocation for complex tasks.
-
-## Execution Boundary (5-Layer Defence-in-Depth)
-
-Adapted from Claude Code's 7-layer permission system for a sub-agent whose
-threat model is **knowledge pollution**, not shell injection.
-
-| Layer | Guards | Hard-Deny Triggers |
-|-------|--------|-------------------|
-| 1 — Input | Injection detection, mode consistency | System-override patterns, mode-protocol mismatch |
-| 2 — Tool | Per-tool safety attributes + `check_permissions()` | **MODIFIES_SKILLS** (bypass-immune) |
-| 3 — Vault | Size cap (8KB), rate limit (50/session), dedup, GLOBAL quality ≥4 | Exceeding caps, GLOBAL with low quality |
-| 3.5 — Root Config | Write gating for CLAUDE.md, agents/*.md, settings.json | Sub-agent writes to root config → WARN |
-| 4 — Output | Schema enforcement, sensitive-data scan, size cap | Schema violation, payload overflow |
-| 5 — Breaker | Denial tracking, 3-state machine (CLOSED/HALF_OPEN/OPEN) | 3 consecutive denials → OPEN (5 min cooldown) |
-
-**Key rule:** `MODIFIES_SKILLS = False` for all tools. Skill modification is
-bypass-immune — PromptCraft only suggests, the main agent executes.
+- **loop_compile**: Per-iteration prompt compiler — L0/L1/L2 incremental recompilation with 4 hard gates
+- **Loop Objective Anchoring**: Auto-generated stable reference at round 1 via 3 sources — prevents goal drift across rounds
+- **Constraint Retirement (v3.5)**: Stale constraints with no activity signal for 3 consecutive rounds auto-retire — prevents prompt bloat
+- **Rolling Summary (v3.5)**: Deterministic cross-round knowledge distillation — quality trajectory, what worked, recurring issues, key lessons — injected into L1/L2 prompts
+- **Adaptive Technique Routing (v3.5)**: Quality-driven fallback from keyword heuristic — 2+ consecutive low-quality rounds trigger rotation (e.g., zero-shot → few-shot)
+- **Feedback Quality Backfill (v3.5.1)**: Feedback quality scores written with loop-aware task_ids, merged into lineage entries during hydrate — enables end-to-end adaptive routing
+- **Cross-Round Vault Memory**: Lineage persisted each round → vault → hydrated next round → get_previous_round()
+- **Dual-Key Goal Identity**: goal_id (stable semantic key) + goal_text_hash (drift detection, advisory only)
+- **Task Alignment**: Validates Agent-proposed next tasks against Loop Objective — distinguishes legitimate evolution from drift
+- **Bidirectional Lineage Storage**: Vault JSON (primary, searchable) + Markdown frontmatter with YAML headers (human-readable, git-friendly, fallback read path). L0 cache reuses actual cached prompts from Markdown files.
+- **4 Soft Advisories**: Task alignment, loop health, repair cues, forward hints — all warnings, never hard gates
+- **Circuit Breaker**: Pure-function trend detection — 3 consecutive no-improvement rounds → STALLED. Counter updated only on feedback events.
+- **Multi-Project Federation**: Two-tier vault — global (`~/.promptcraft/`) + project (`./.promptcraft/`)
+- **Append-only Vault**: Full version history, rollback support, bidirectional storage (JSON + Markdown frontmatter)
+- **Shared vault I/O**: `vault_io.py` — single source of truth for `read_vault` / `write_vault`, used by both checkpoint and hydrate
+- **186 tests**, Python stdlib only, zero external dependencies
 
 ## Project Structure
 
 ```
-PromptCraft/
-├── promptcraft-agent/
-│   ├── subagent_adapter.py    # Unified entry point, 6-mode routing
-│   ├── engine.py              # Lifecycle manager + vault I/O + circuit breaker
-│   ├── builder.py             # Technique router (keyword heuristic) + quality scoring
-│   ├── protocol.py            # I/O schemas, 6 Mode values
-│   ├── health_report.py       # HealthReport + threshold gating
-│   ├── boundary.py            # 5-layer execution boundary + circuit breaker
-│   ├── AGENT.md               # Claude Code sub-agent definition
-│   └── tools/                 # 4-engine tool system
-│       ├── base.py            # Tool base + safety attributes
-│       ├── personalization.py # Skill overlay injection
-│       ├── prompt_build.py    # Technique selector (prepares context for LLM)
-│       ├── pattern_analysis.py # Aggregate pattern discovery
-│       └── skill_advisor.py   # Evolution/creation suggestions
+PromptCraft-loop_compile/
+├── loop-compiler/
+│   ├── subagent_adapter.py    # Unified entry point, 3-mode routing
+│   ├── engine.py              # Lifecycle + vault I/O + circuit breaker + YAML dual-write
+│   ├── loop_compiler.py       # Pure-function compiler: gates + advisories + L0/L1/L2
+│   ├── builder.py             # Technique router (keyword + adaptive) + quality scoring
+│   └── protocol.py            # I/O schemas, 19 types
 ├── skills/
 │   ├── prompt-memory/         # Dual-storage vault I/O + federation
-│   │   ├── scripts/           #   checkpoint.py + hydrate.py
-│   │   └── references/        #   vault schema
-│   ├── prompt-techniques/     # Catalog of 7 techniques
-│   │   └── references/        #   LLM reads these to generate prompts
+│   │   └── scripts/           # checkpoint.py, hydrate.py, vault_io.py
+│   └── prompt-techniques/     # Catalog of 7 techniques
 ├── tests/
-│   ├── test_scripts.py        # checkpoint, hydrate, federation, freshness
-│   ├── test_health_report.py  # thresholds, stall, consistency, proactive
-│   ├── test_subagent_adapter.py # routing, parsing, batch, E2E
-│   ├── test_engine_modes.py   # 5 invoke_* + silent analyze + batch
-│   ├── test_integration.py    # full closed-loop workflows
-│   └── test_boundary.py       # 5-layer guards, breaker, tools, batch input
-├── .claude/agents/            # Sub-agent registration + system prompt
-├── CLAUDE.md                  # Project conventions + auto-trigger rules
+│   ├── test_loop_compiler.py  # 94 tests: gates, advisories, L0/L1/L2, constraint retirement, rolling summary, adaptive routing
+│   ├── test_scripts.py        # 49 tests: checkpoint, hydrate, federation
+│   ├── test_engine_modes.py   # 22 tests: invoke_*, YAML frontmatter, lineage md
+│   ├── test_subagent_adapter.py # 7 tests: routing, parsing, formatting
+│   └── test_integration.py    # 9 tests: closed-loop workflows, breaker, feedback backfill
+├── CLAUDE.md                  # Project conventions
 └── README.md / README.zh-CN.md
 ```
 
-## Key Features
-
-- **LLM-Driven Prompt Generation**: Python selects the technique via keyword
-  heuristic; the LLM sub-agent reads the technique reference file and generates
-  a structured prompt adaptive to task complexity. No hardcoded string templates.
-- **Sub-Agent Architecture**: Isolated context, vault-backed persistence,
-  cross-session improvement — auto-trigger rules in CLAUDE.md with vault-hydrate preflight
-- **Auto-Trigger Rules**: CLAUDE.md includes 6 behavioural trigger conditions
-  (correction spirals, intent flips, repeated errors, requirement accumulation,
-  task verbs) — zero-cost pattern matching, false-positive cost is minimal
-- **Proactive Vault Hints**: Health Report surfaces similar past tasks even
-  below the 10-record analysis threshold (`hint: similar→solidity-audit q=4.2`)
-- **Batch Processing**: Process multiple tasks in one call — hydrate once,
-  group by Skill match, execute in parallel (max 4 workers)
-- **5-Layer Execution Boundary**: Defence-in-depth with root-config write gating
-  (Layer 3.5) — sub-agent cannot silently modify CLAUDE.md or settings.json
-- **Circuit Breaker**: 3-state machine (CLOSED → OPEN → HALF_OPEN) with
-  denial tracking and automatic cooldown, merged into boundary.py
-- **Multi-Project Federation**: Two-tier vault — global (`~/.promptcraft/`)
-  + project (`./.promptcraft/`)
-- **Query Expansion**: Synonym-based query expansion with cross-language
-  (CJK→EN) mapping before Jaccard search (zero-dependency)
-- **Batch Feedback Persistence**: Buffered vault writes — feedback records
-  accumulate in-memory and flush to vault in batches (NDJSON), reducing
-  subprocess overhead
-- **Engine Metrics**: Observable silent-failure counters (vault write errors,
-  subprocess timeouts, analysis errors) surfaced via HealthReport degradation
-- **Vault Pruning**: `hydrate.py --prune --older-than N` for stale entry
-  cleanup — GLOBAL entries never pruned, `.md` files preserved
-- **Execution Feedback Loop**: Structured quality scoring (1-5) written back
-  to vault after every execution
-- **Health Report**: Compact one-line signal — `[PC: N records, action=...]` —
-  tells the main agent when to run analysis or advice
-- **Skill-Advisor**: Data-backed evolution/creation suggestions — never
-  auto-modifies Skills
-- **Append-only Vault**: Full version history, rollback support, dual storage
-  (JSON index + Markdown prompts)
-- **Multi-Script Tokenizer**: CJK + Japanese Kana + Korean Hangul + Latin + Cyrillic
-
-## Tech Stack
-
-- **Python stdlib only** — no pip install, no venv
-- **Dual storage** — JSON vault (metadata) + `.md` files (full prompts)
-- **Two-tier federation** — global vault + project vault, auto-merged
-- **Sub-agent model** — isolated context, trigger-based wake-up
-- **Jaccard similarity** — multi-script tokenizer, zero external deps
-- **Zero external API calls** — no embedding services, no proprietary APIs
-
 ## Design Principles
 
-- **Python classifies, LLM generates** — technique selection is keyword heuristic
-  (fast, zero-cost); prompt writing is LLM-driven (reads references, applies technique)
+- **Python classifies, LLM generates** — technique selection is keyword heuristic; prompt writing is LLM-driven
+- **Loop Objective is an anchor, not a planner** — it freezes what+why, doesn't decompose work
+- **Soft advisories never block** — task_alignment, loop_health, repair cues are warnings, not hard gates
 - **Enhance, don't replace** — Skills own the workflow, PromptCraft provides overlay
-- **Fail-closed** — guards deny when uncertain; MODIFIES_SKILLS is bypass-immune
-- **Health Report only** — internal vault state is never exposed to the main agent
+- **Fail-closed** — guards deny when uncertain
 - **Never auto-modify Skills** — suggestions only, execution is the main agent's job
-- **importance = blast radius** — GLOBAL affects all projects, escalation requires data
 - **Append, never overwrite** — full version history preserved
 - **Zero external dependencies** — plain filesystem, human-readable JSON/Markdown
 

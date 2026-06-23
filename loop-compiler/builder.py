@@ -59,7 +59,7 @@ _LOW_LOAD_WORDS = {
 }
 _CONTINUOUS_WORDS = {
     "fix", "modify", "update", "change", "refactor", "extend",
-    "add to", "improve", "debug",
+    "add", "improve", "debug",
 }
 
 
@@ -95,6 +95,7 @@ def route_technique(task: str, context=None) -> Analysis:
         rationale=_RATIONALE.get(technique, "Default route."),
         independence=independence,
         cognitive_load=load,
+        reference_file=TECHNIQUE_REFERENCE.get(technique.value, ""),
     )
 
 
@@ -131,6 +132,112 @@ def score_quality(feedback) -> int:
 
 
 # ── Vault context helpers ───────────────────────────────────────────────────────
+
+# ── Adaptive Technique Routing (v3.5) ──────────────────────────────────────────
+
+# Fallback chain: when the current technique yields 2+ consecutive low-quality
+# rounds within the same loop, rotate to the next technique. This is a
+# quality-driven correction on top of the keyword heuristic — not a replacement.
+_TECHNIQUE_FALLBACK: dict[str, str] = {
+    "zero-shot":       "few-shot",
+    "few-shot":        "zero-shot-cot",
+    "zero-shot-cot":   "few-shot-cot",
+    "few-shot-cot":    "tree-of-thought",
+    "step-back":       "least-to-most",
+    "least-to-most":   "tree-of-thought",
+    "tree-of-thought": "tree-of-thought",  # Ceiling — no further rotation
+}
+
+_ADAPTIVE_LOW_QUALITY_THRESHOLD = 3   # Quality < this is "low"
+_ADAPTIVE_CONSECUTIVE_ROUNDS = 2       # Consecutive low-quality rounds to trigger rotation
+
+
+def _count_consecutive_low_quality(
+    technique: str,
+    loop_id: str,
+    vault_context: dict[str, Any] | None,
+) -> int:
+    """Count how many consecutive recent rounds used `technique` and scored < 3."""
+    if vault_context is None:
+        return 0
+    results = vault_context.get("results", [])
+    if not results:
+        return 0
+
+    # Filter to this loop, sort by round descending
+    rounds: list[dict[str, Any]] = []
+    for r in results:
+        lineage = r.get("loop_lineage") or r.get("lineage") or {}
+        if lineage.get("loop_id") == loop_id:
+            # technique_used lives as skill_used in JSON vault, technique_used in markdown
+            technique_used = r.get("technique_used") or r.get("skill_used") or ""
+            rounds.append({
+                "round": lineage.get("round", 0),
+                "quality_score": lineage.get("quality_score", 0),
+                "technique_used": technique_used,
+            })
+    rounds.sort(key=lambda x: x["round"], reverse=True)
+
+    count = 0
+    for rnd in rounds:
+        # Only count rounds that used THIS technique
+        if rnd["technique_used"] and rnd["technique_used"] != technique:
+            break  # Different technique — break the consecutive chain
+        if rnd["quality_score"] > 0 and rnd["quality_score"] < _ADAPTIVE_LOW_QUALITY_THRESHOLD:
+            count += 1
+        else:
+            break  # High quality or zero score (no feedback) — break the chain
+    return count
+
+
+def route_technique_adaptive(
+    task: str,
+    vault_context: dict[str, Any] | None = None,
+    loop_id: str = "",
+) -> Analysis:
+    """Select the best technique via keyword heuristic, then apply quality-driven
+    fallback rotation if the current technique has underperformed.
+
+    Keeps the original keyword analysis intact — rotation is recorded in
+    Analysis.was_rotated and the rationale is appended.
+    """
+    # Step 1: Keyword heuristic (always)
+    analysis = route_technique(task)
+
+    if not vault_context or not loop_id:
+        return analysis
+
+    # Step 2: Check if current technique needs rotation
+    technique = analysis.technique
+    low_count = _count_consecutive_low_quality(technique, loop_id, vault_context)
+
+    if low_count < _ADAPTIVE_CONSECUTIVE_ROUNDS:
+        return analysis
+
+    # Step 3: Rotate
+    fallback = _TECHNIQUE_FALLBACK.get(technique, technique)
+    if fallback == technique:
+        return analysis  # Already at ceiling
+
+    original_technique = technique
+    original_rationale = analysis.rationale
+
+    return Analysis(
+        technique=fallback,
+        rationale=(
+            f"{original_rationale} [ROTATED: {original_technique} → {fallback} — "
+            f"{low_count} consecutive low-quality rounds (score < {_ADAPTIVE_LOW_QUALITY_THRESHOLD})]"
+        ),
+        independence=analysis.independence,
+        cognitive_load=(
+            "high" if fallback in ("tree-of-thought", "few-shot-cot")
+            else "medium" if fallback in ("zero-shot-cot", "least-to-most")
+            else analysis.cognitive_load
+        ),
+        reference_file=TECHNIQUE_REFERENCE.get(fallback, analysis.reference_file),
+        was_rotated=True,
+    )
+
 
 def extract_global_constraints(hydrate_results: dict[str, Any] | None) -> list[str]:
     """Extract GLOBAL hard constraints from hydrate results.

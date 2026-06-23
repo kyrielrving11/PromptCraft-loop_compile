@@ -46,7 +46,7 @@ class TestCheckpoint(unittest.TestCase):
 
     def test_read_vault_missing(self):
         vault_path = self.tmp_path / "nonexistent.json"
-        data = checkpoint._read_vault(vault_path)
+        data = checkpoint.read_vault(vault_path)
         self.assertEqual(data, {"version": "1", "entries": []})
 
     def test_read_vault_valid(self):
@@ -55,13 +55,13 @@ class TestCheckpoint(unittest.TestCase):
             '{"version": "1", "entries": [{"id": "a", "task_id": "t1"}]}',
             encoding="utf-8",
         )
-        data = checkpoint._read_vault(vault_path)
+        data = checkpoint.read_vault(vault_path)
         self.assertEqual(len(data["entries"]), 1)
 
     def test_read_vault_corrupted(self):
         vault_path = self.tmp_path / "bad.json"
         vault_path.write_text("{not valid json", encoding="utf-8")
-        data = checkpoint._read_vault(vault_path)
+        data = checkpoint.read_vault(vault_path)
         self.assertEqual(data, {"version": "1", "entries": []})
 
     def test_read_vault_filters_non_dict_entries(self):
@@ -70,7 +70,7 @@ class TestCheckpoint(unittest.TestCase):
             '{"entries": [{"id": "a"}, "bad_string", 123, {"id": "b"}]}',
             encoding="utf-8",
         )
-        data = checkpoint._read_vault(vault_path)
+        data = checkpoint.read_vault(vault_path)
         self.assertEqual(len(data["entries"]), 2)
         self.assertTrue(all(isinstance(e, dict) for e in data["entries"]))
 
@@ -180,7 +180,7 @@ class TestCheckpoint(unittest.TestCase):
 
     def test_write_vault_creates_parent_dir(self):
         vault_path = self.tmp_path / "sub" / "vault.json"
-        checkpoint._write_vault(vault_path, {"version": "1", "entries": []})
+        checkpoint.write_vault(vault_path, {"version": "1", "entries": []})
         self.assertTrue(vault_path.exists())
 
     def test_write_prompt_md(self):
@@ -259,7 +259,7 @@ class TestHydrate(unittest.TestCase):
     def test_read_vault_error_handling(self):
         vault_path = self.tmp_path / "corrupt.json"
         vault_path.write_text("{{{bad", encoding="utf-8")
-        data = hydrate._read_vault(vault_path)
+        data = hydrate.read_vault(vault_path)
         self.assertEqual(data, {"version": "1", "entries": []})
 
     def test_compact_entry_default(self):
@@ -419,10 +419,10 @@ class TestAggregate(unittest.TestCase):
             }
             entry = checkpoint._build_entry(payload, vault, prompts_dir, None)
             # _build_entry appends to vault["entries"] and sets is_active
-        checkpoint._write_vault(vault_path, vault)
+        checkpoint.write_vault(vault_path, vault)
 
         # Reread and aggregate
-        vault2 = hydrate._read_vault(vault_path)
+        vault2 = hydrate.read_vault(vault_path)
 
         class Args:
             group_by = "task_type"
@@ -454,9 +454,9 @@ class TestAggregate(unittest.TestCase):
                 "task_type": "api_design", "quality_score": 4,
             }
             checkpoint._build_entry(payload, vault, prompts_dir, None)
-        checkpoint._write_vault(vault_path, vault)
+        checkpoint.write_vault(vault_path, vault)
 
-        vault2 = hydrate._read_vault(vault_path)
+        vault2 = hydrate.read_vault(vault_path)
 
         class Args:
             group_by = "task_type"
@@ -488,9 +488,9 @@ class TestAggregate(unittest.TestCase):
                 "quality_score": 4,
             }
             checkpoint._build_entry(payload, vault, prompts_dir, None)
-        checkpoint._write_vault(vault_path, vault)
+        checkpoint.write_vault(vault_path, vault)
 
-        vault2 = hydrate._read_vault(vault_path)
+        vault2 = hydrate.read_vault(vault_path)
 
         class Args:
             group_by = "task_type"

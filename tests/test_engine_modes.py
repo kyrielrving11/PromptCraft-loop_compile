@@ -7,38 +7,27 @@ import sys
 import unittest
 from pathlib import Path
 
-AGENT_DIR = Path(__file__).resolve().parent.parent / "promptcraft-agent"
+AGENT_DIR = Path(__file__).resolve().parent.parent / "loop-compiler"
 sys.path.insert(0, str(AGENT_DIR))
 
+import os
+import tempfile
+
 from protocol import (
-    AgentStatus, BatchRequest, BatchItem, Mode, PromptCraftRequest,
+    AgentStatus, Mode, PromptCraftRequest,
 )
-from engine import create_engine, PromptCraftEngine
-from health_report import HealthReport
-
-
-class TestInvokeOverlay(unittest.TestCase):
-    """invoke_overlay() — Skill personalisation."""
-
-    def setUp(self):
-        self.engine = create_engine()
-
-    def test_overlay_with_skill_name(self):
-        r = PromptCraftRequest(
-            task="audit contract",
-            mode=Mode.OVERLAY,
-            skill_name="solidity-audit",
-        )
-        result = self.engine.invoke_overlay(r)
-        self.assertEqual(result.status, AgentStatus.OK)
-        self.assertIn("Personalization Overlay", result.response.prompt)
-        self.assertIn("solidity-audit", result.response.prompt)
-
-    def test_overlay_without_skill_name_errors(self):
-        r = PromptCraftRequest(task="audit", mode=Mode.OVERLAY)
-        result = self.engine.invoke_overlay(r)
-        self.assertEqual(result.status, AgentStatus.ERROR)
-        self.assertIn("skill_name", result.response.error)
+from engine import (
+    create_engine,
+    _build_yaml_frontmatter,
+    _parse_yaml_frontmatter,
+    _escape_yaml_string,
+    _coerce_yaml_scalar,
+    _write_lineage_md,
+    _read_lineage_md,
+    _scan_lineage_md,
+    _lineage_dir_name,
+)
+# v3.4: HealthReport deleted
 
 
 class TestInvokeBuild(unittest.TestCase):
@@ -48,26 +37,23 @@ class TestInvokeBuild(unittest.TestCase):
         self.engine = create_engine()
 
     def test_build_returns_technique_selection(self):
-        """Build mode now returns technique selection + LLM instructions,
-        not a pre-generated 8-section prompt."""
-        r = PromptCraftRequest(task="build a REST API", mode=Mode.FULL)
+        """v3.4: build mode uses builder.route_technique for technique selection."""
+        r = PromptCraftRequest(task="build a REST API", mode=Mode.BUILD)
         result = self.engine.invoke_build(r)
         self.assertEqual(result.status, AgentStatus.OK)
         prompt = result.response.prompt
-        self.assertIn("Technique Selected", prompt)
-        self.assertIn("Reference file", prompt)
-        self.assertIn("Next Step", prompt)
-        self.assertIn("Generate the complete 8-section prompt", prompt)
-        # Analysis should contain the selected technique
+        self.assertIn("**Technique**", prompt)
+        self.assertIn("### Task", prompt)
+        self.assertIn("### Instructions", prompt)
         self.assertIsNotNone(result.response.analysis)
         self.assertIn(result.response.analysis.technique,
                       ["zero-shot", "few-shot", "zero-shot-cot", "few-shot-cot",
                        "step-back", "least-to-most", "tree-of-thought"])
 
     def test_build_tracks_state(self):
-        r = PromptCraftRequest(task="test", mode=Mode.FULL)
-        self.engine.invoke_build(r)
-        self.assertEqual(self.engine.state.call_count, 1)
+        r = PromptCraftRequest(task="test", mode=Mode.BUILD)
+        result = self.engine.invoke_build(r)
+        self.assertEqual(result.status, AgentStatus.OK)
 
 
 class TestInvokeFeedback(unittest.TestCase):
@@ -77,6 +63,7 @@ class TestInvokeFeedback(unittest.TestCase):
         self.engine = create_engine()
 
     def test_feedback_success_records(self):
+        """v3.4: feedback records vault write + quality tracking."""
         r = PromptCraftRequest(
             task="test task",
             mode=Mode.FEEDBACK,
@@ -84,153 +71,184 @@ class TestInvokeFeedback(unittest.TestCase):
         )
         result = self.engine.invoke_feedback(r)
         self.assertEqual(result.status, AgentStatus.OK)
-        self.assertIsNotNone(result.feedback)
-        self.assertGreaterEqual(result.feedback.quality_score, 4)
+        self.assertIsNotNone(result.response)
+        # Quality trend is tracked in state
+        self.assertGreaterEqual(len(self.engine.state.quality_trend), 1)
 
     def test_feedback_accumulates_in_buffer(self):
+        """v3.4: feedback increments call_count instead of buffer."""
         r = PromptCraftRequest(
             task="task", mode=Mode.FEEDBACK,
             feedback={"output": "ok", "success": True},
         )
         self.engine.invoke_feedback(r)
-        self.assertGreaterEqual(len(self.engine.state.feedback_buffer), 1)
+        self.assertGreaterEqual(self.engine.state.call_count, 1)
 
 
-class TestInvokeAnalyze(unittest.TestCase):
-    """invoke_analyze() — pattern analysis."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# YAML Frontmatter helpers (stdlib-only, engine.py module-level)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestYamlFrontmatter(unittest.TestCase):
+    """Tests for _build/parse_yaml_frontmatter, _escape, _coerce."""
+
+    def test_escape_safe_string(self):
+        self.assertEqual(_escape_yaml_string("hello"), "hello")
+        self.assertEqual(_escape_yaml_string("audit-erc20"), "audit-erc20")
+
+    def test_escape_special_chars(self):
+        self.assertIn('"', _escape_yaml_string("hello: world"))
+        self.assertIn('"', _escape_yaml_string("key: value"))
+
+    def test_escape_empty_string(self):
+        self.assertEqual(_escape_yaml_string(""), '""')
+
+    def test_coerce_scalar_bool(self):
+        self.assertTrue(_coerce_yaml_scalar("true"))
+        self.assertTrue(_coerce_yaml_scalar("True"))
+        self.assertFalse(_coerce_yaml_scalar("false"))
+
+    def test_coerce_scalar_number(self):
+        self.assertEqual(_coerce_yaml_scalar("42"), 42)
+        self.assertAlmostEqual(_coerce_yaml_scalar("3.14"), 3.14)
+
+    def test_coerce_scalar_null(self):
+        self.assertIsNone(_coerce_yaml_scalar("null"))
+        self.assertIsNone(_coerce_yaml_scalar("None"))
+
+    def test_coerce_scalar_string(self):
+        self.assertEqual(_coerce_yaml_scalar("hello"), "hello")
+
+    def test_build_flat_scalars(self):
+        yaml_str = _build_yaml_frontmatter({
+            "loop_id": "test", "round": 3, "success": True,
+            "quality_score": 0, "goal_text_hash": "abc123",
+        })
+        self.assertIn("loop_id: test", yaml_str)
+        self.assertIn("round: 3", yaml_str)
+        self.assertIn("success: true", yaml_str)
+        self.assertIn("quality_score: 0", yaml_str)
+
+    def test_build_list_values(self):
+        yaml_str = _build_yaml_frontmatter({
+            "constraints_active": ["check reentrancy", "verify acl"],
+        })
+        self.assertIn("constraints_active:", yaml_str)
+        self.assertIn("- check reentrancy", yaml_str)
+        self.assertIn("- verify acl", yaml_str)
+
+    def test_build_nested_dict(self):
+        yaml_str = _build_yaml_frontmatter({
+            "loop_objective": {
+                "objective": "Audit token",
+                "success_criteria": ["all paths"],
+                "hard_constraints": ["read-only"],
+            },
+        })
+        self.assertIn("loop_objective:", yaml_str)
+        self.assertIn("objective: Audit token", yaml_str)
+        self.assertIn("success_criteria:", yaml_str)
+        self.assertIn("- all paths", yaml_str)
+
+    def test_roundtrip_full_lineage(self):
+        """Build frontmatter → parse back → all fields survive."""
+        data = {
+            "loop_id": "e2e-test", "round": 2, "goal_id": "audit",
+            "goal_text_hash": "abc123", "recompile_level": "l1",
+            "quality_score": 4,
+            "constraints_active": ["check reentrancy", "verify acl"],
+            "task": "Audit ERC20 for vulnerabilities",
+            "success": True, "technique_used": "few-shot-cot",
+            "timestamp": "2026-06-23T10:30:00+00:00",
+            "loop_objective": {
+                "objective": "Audit ERC20",
+                "success_criteria": ["all paths audited"],
+                "hard_constraints": ["read-only audit"],
+            },
+        }
+        yaml_block = _build_yaml_frontmatter(data)
+        full = f"---\n{yaml_block}\n---\n\n# Body text"
+        parsed = _parse_yaml_frontmatter(full)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["loop_id"], "e2e-test")
+        self.assertEqual(parsed["round"], 2)
+        self.assertEqual(parsed["goal_id"], "audit")
+        self.assertEqual(parsed["recompile_level"], "l1")
+        self.assertEqual(parsed["quality_score"], 4)
+        self.assertEqual(parsed["constraints_active"], ["check reentrancy", "verify acl"])
+        self.assertTrue(parsed["success"])
+        self.assertEqual(parsed["technique_used"], "few-shot-cot")
+        self.assertIn("loop_objective", parsed)
+        self.assertEqual(parsed["loop_objective"]["objective"], "Audit ERC20")
+
+    def test_parse_returns_none_for_no_frontmatter(self):
+        self.assertIsNone(_parse_yaml_frontmatter("Just markdown, no frontmatter."))
+
+    def test_parse_handles_empty_yaml(self):
+        result = _parse_yaml_frontmatter("---\n---\n\nBody only")
+        self.assertEqual(result, {})
+
+
+class TestLineageMarkdownDualWrite(unittest.TestCase):
+    """Integration tests for _write_lineage_md / _read_lineage_md / _scan_lineage_md."""
 
     def setUp(self):
-        self.engine = create_engine()
+        self._old_cwd = os.getcwd()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        os.chdir(self._tmpdir.name)
 
-    def test_analyze_insufficient_data(self):
-        r = PromptCraftRequest(task="analyze", mode=Mode.ANALYZE)
-        result = self.engine.invoke_analyze(r)
-        # With insufficient records, returns ERROR with an informative message
-        text = (result.response.prompt or "") + (result.response.error or "")
-        self.assertTrue(len(text) > 0)  # Some message is returned
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmpdir.cleanup()
 
-
-class TestInvokeAdvise(unittest.TestCase):
-    """invoke_advise() — skill advisor."""
-
-    def setUp(self):
-        self.engine = create_engine()
-
-    def test_advise_insufficient_data(self):
-        r = PromptCraftRequest(task="advise", mode=Mode.ADVISE)
-        result = self.engine.invoke_advise(r)
-        # With insufficient data, may return an informative message or error
-        text = (result.response.prompt or "") + (result.response.error or "")
-        self.assertTrue(len(text) > 0)
-
-
-class TestMaybeSilentAnalyze(unittest.TestCase):
-    """maybe_silent_analyze() — silent pattern analysis."""
-
-    def setUp(self):
-        self.engine = create_engine()
-
-    def test_returns_health_report(self):
-        h = self.engine.maybe_silent_analyze()
-        self.assertIsInstance(h, HealthReport)
-
-    def test_null_state_returns_empty_health(self):
-        self.engine.state = None
-        h = self.engine.maybe_silent_analyze()
-        self.assertEqual(h.feedback_buffer_size, 0)
-
-    def test_insufficient_data_no_analysis(self):
-        # Force lazy init via a method call
-        self.engine._ensure_init(
-            PromptCraftRequest(task="t", mode=Mode.FEEDBACK)
+    def test_write_and_read_roundtrip(self):
+        md_path = _write_lineage_md(
+            loop_id="test-loop",
+            round_num=1,
+            goal_id="audit",
+            goal_text_hash="hash123",
+            recompile_level="l2",
+            constraints_active=["c1", "c2"],
+            task="Audit token",
+            prompt_text="## Compiled Prompt\n\nDo the thing.",
+            technique_used="zero-shot",
+            loop_objective={"objective": "Audit", "success_criteria": ["all"]},
         )
-        self.engine.state.feedback_buffer = [{"quality_score": 4}] * 5
-        h = self.engine.maybe_silent_analyze()
-        self.assertFalse(h.analysis_ran_this_time)
+        self.assertIsNotNone(md_path)
+        self.assertTrue(md_path.endswith("r1.md"))
 
-    def test_sufficient_data_triggers_analysis(self):
-        self.engine._ensure_init(
-            PromptCraftRequest(task="t", mode=Mode.FEEDBACK)
-        )
-        self.engine.state.feedback_buffer = [{"quality_score": 4}] * 10
-        h = self.engine.maybe_silent_analyze()
-        self.assertTrue(h.analysis_ran_this_time)
-        self.assertTrue(h.pattern_detected)
+        entry = _read_lineage_md("test-loop", 1)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["loop_id"], "test-loop")
+        self.assertEqual(entry["loop_lineage"]["round"], 1)
+        self.assertEqual(entry["loop_lineage"]["goal_id"], "audit")
+        self.assertIn("## Compiled Prompt", entry["full_prompt"])
+        self.assertIn("Do the thing.", entry["full_prompt"])
+        self.assertEqual(entry["loop_lineage"]["constraints_active"], ["c1", "c2"])
+        self.assertEqual(entry["technique_used"], "zero-shot")
 
+    def test_scan_multiple_rounds(self):
+        for r in (1, 2, 3):
+            _write_lineage_md(
+                loop_id="multi", round_num=r, goal_id="g",
+                goal_text_hash=f"h{r}", recompile_level="l0",
+                constraints_active=[], task=f"Task {r}",
+                prompt_text=f"Prompt {r}",
+            )
+        scanned = _scan_lineage_md("multi")
+        self.assertEqual(len(scanned), 3)
+        rounds = [e["loop_lineage"]["round"] for e in scanned]
+        self.assertEqual(rounds, [3, 2, 1])  # Sorted descending
 
-class TestBackwardCompatInvoke(unittest.TestCase):
-    """invoke() still routes correctly (backward compatibility)."""
+    def test_read_nonexistent_returns_none(self):
+        self.assertIsNone(_read_lineage_md("no-such-loop", 1))
 
-    def setUp(self):
-        self.engine = create_engine()
+    def test_scan_empty_returns_empty_list(self):
+        self.assertEqual(_scan_lineage_md("no-such-loop"), [])
 
-    def test_invoke_full_delegates_to_build(self):
-        r = PromptCraftRequest(task="test", mode=Mode.FULL)
-        result = self.engine.invoke(r)
-        self.assertEqual(result.status, AgentStatus.OK)
-        self.assertIn("Technique Selected", result.response.prompt)
-
-    def test_invoke_overlay_mode(self):
-        r = PromptCraftRequest(
-            task="audit", mode=Mode.OVERLAY,
-            skill_name="solidity-audit",
-        )
-        result = self.engine.invoke(r)
-        self.assertIn("Personalization Overlay", result.response.prompt)
-
-
-class TestInvokeBatch(unittest.TestCase):
-    """Phase 5: batch processing mode."""
-
-    def setUp(self):
-        self.engine = create_engine()
-
-    def test_batch_empty_items_returns_error(self):
-        """Empty items list returns error."""
-        req = BatchRequest(items=[])
-        resp = self.engine.invoke_batch(req)
-        self.assertEqual(resp.status, AgentStatus.ERROR)
-        self.assertIn("at least one item", resp.error)
-
-    def test_batch_single_item_no_skill(self):
-        """One item without skill_name calls invoke_build."""
-        req = BatchRequest(items=[BatchItem(task="audit token")])
-        resp = self.engine.invoke_batch(req)
-        self.assertEqual(resp.batch_summary.total, 1)
-        self.assertEqual(resp.batch_summary.succeeded, 1)
-        self.assertEqual(resp.item_results[0]["status"], "ok")
-
-    def test_batch_single_item_with_skill(self):
-        """One item with skill_name calls invoke_overlay."""
-        req = BatchRequest(items=[
-            BatchItem(task="audit staking", skill_name="solidity-audit")
-        ])
-        resp = self.engine.invoke_batch(req)
-        self.assertEqual(resp.batch_summary.total, 1)
-        self.assertEqual(resp.batch_summary.succeeded, 1)
-
-    def test_batch_multiple_items_mixed(self):
-        """Mixed items (with and without skill) all processed."""
-        req = BatchRequest(items=[
-            BatchItem(task="audit token", skill_name="solidity-audit"),
-            BatchItem(task="write API docs"),
-            BatchItem(task="audit staking", skill_name="solidity-audit"),
-        ])
-        resp = self.engine.invoke_batch(req)
-        self.assertEqual(resp.batch_summary.total, 3)
-        self.assertEqual(len(resp.item_results), 3)
-
-    def test_batch_summary_counts(self):
-        """BatchSummary counts reflect all items."""
-        req = BatchRequest(items=[
-            BatchItem(task="task a"),
-            BatchItem(task="task b"),
-        ])
-        resp = self.engine.invoke_batch(req)
-        s = resp.batch_summary
-        self.assertEqual(s.total, 2)
-        self.assertEqual(s.succeeded + s.failed, 2)
+    def test_lineage_dir_name_replaces_colons(self):
+        # Windows safety: colons in loop_id are replaced with hyphens
+        self.assertEqual(_lineage_dir_name("loop:smoke"), "loop-smoke")
+        self.assertEqual(_lineage_dir_name("simple-id"), "simple-id")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)

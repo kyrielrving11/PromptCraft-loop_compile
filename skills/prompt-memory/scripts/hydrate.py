@@ -70,32 +70,7 @@ FRESHNESS_STALE_DAYS = 30       # Entries older than this get a freshness penalt
 FRESHNESS_PENALTY_FACTOR = 0.7  # Multiply score by this factor for stale entries
 
 
-def _read_vault(path: Path) -> dict:
-    """Read the vault file with graceful error handling."""
-    if not path.exists():
-        return {"version": "1", "entries": []}
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        print(json.dumps({"status": "warning", "message": f"Vault is corrupted ({exc}). Starting with empty vault."}))
-        return {"version": "1", "entries": []}
-    if not isinstance(data, dict):
-        print(json.dumps({"status": "warning", "message": "Vault is not a JSON object. Starting with empty vault."}))
-        return {"version": "1", "entries": []}
-    if not isinstance(data.get("entries"), list):
-        data["entries"] = []
-    # Filter out malformed entries (non-dict)
-    data["entries"] = [e for e in data["entries"] if isinstance(e, dict)]
-    data.setdefault("version", "1")
-    return data
-
-
-def _write_vault(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+from vault_io import read_vault, write_vault
 
 
 def _read_prompt_md(md_path: str) -> str:
@@ -352,6 +327,12 @@ def _compact_entry(entry: dict, *, include_prompt: bool = False) -> dict:
         "execution_feedback": entry.get("execution_feedback", ""),
         "tags": entry.get("tags", []),
         "score": entry.get("score", 0),
+        # v3.4: loop_compile cross-round fields
+        "loop_id": entry.get("loop_id", ""),
+        "loop_lineage": entry.get("loop_lineage"),
+        "loop_objective": entry.get("loop_objective"),
+        "task": entry.get("task"),
+        "quality_score": entry.get("quality_score", 0),
     }
     # Always include summary if present (privacy-safe: no raw prompt text)
     if entry.get("summary"):
@@ -383,7 +364,7 @@ def _compact_entry(entry: dict, *, include_prompt: bool = False) -> dict:
         if warning:
             compact["freshness_warning"] = warning
 
-    return {k: v for k, v in compact.items() if v not in (None, "", [], 0) or k in ("score",)}
+    return {k: v for k, v in compact.items() if v not in (None, "", [], 0) or k in ("score", "quality_score", "loop_id")}
 
 
 def _is_global(entry: dict) -> bool:
@@ -440,7 +421,7 @@ def cmd_query(args, vault: dict) -> None:
     use_global = not getattr(args, "no_global", False)
     global_vault = None
     if use_global:
-        global_vault = _read_vault(GLOBAL_VAULT) if GLOBAL_VAULT.exists() else None
+        global_vault = read_vault(GLOBAL_VAULT) if GLOBAL_VAULT.exists() else None
 
     all_entries = _merge_global_entries(vault.get("entries", []), global_vault)
     entries = list(all_entries)
@@ -533,7 +514,7 @@ def cmd_rollback(args, vault: dict) -> None:
         print(json.dumps({"status": "error", "message": f"Version {version_tag} not found for task {task_id}."}))
         sys.exit(1)
 
-    _write_vault(args.vault, vault)
+    write_vault(args.vault, vault)
     print(json.dumps({
         "status": "ok",
         "action": "rollback",
@@ -761,7 +742,7 @@ def cmd_prune(args, vault: dict) -> None:
         return
 
     vault["entries"] = kept
-    _write_vault(args.vault, vault)
+    write_vault(args.vault, vault)
 
     print(json.dumps({
         "status": "ok",
@@ -804,7 +785,7 @@ def main() -> None:
                         help="Show what would be pruned without actually removing. Used with --prune.")
     args = parser.parse_args()
 
-    vault = _read_vault(args.vault)
+    vault = read_vault(args.vault)
 
     if args.prune:
         cmd_prune(args, vault)

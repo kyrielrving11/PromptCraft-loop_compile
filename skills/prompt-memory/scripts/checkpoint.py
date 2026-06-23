@@ -33,6 +33,7 @@ _OPTIONAL_KEYS = {
     "skill_used", "stage", "hard_constraints", "key_decisions",
     "generated_prompt", "execution_feedback", "tags", "summary",
     "task_type", "quality_score", "overlay_used",
+    "loop_lineage", "loop_objective", "loop_id",
 }
 
 DEFAULT_VAULT = Path(".promptcraft/prompt_vault.json")
@@ -52,32 +53,7 @@ def _truncate(text: str, max_chars: int = MAX_PREVIEW_CHARS) -> str:
     return text if len(text) <= max_chars else text[:max_chars] + "..."
 
 
-def _read_vault(path: Path) -> dict:
-    """Read the vault file with graceful error handling."""
-    if not path.exists():
-        return {"version": "1", "entries": []}
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        print(json.dumps({"status": "warning", "message": f"Vault is corrupted ({exc}). Starting with empty vault."}))
-        return {"version": "1", "entries": []}
-    if not isinstance(data, dict):
-        print(json.dumps({"status": "warning", "message": "Vault is not a JSON object. Starting with empty vault."}))
-        return {"version": "1", "entries": []}
-    if not isinstance(data.get("entries"), list):
-        data["entries"] = []
-    # Filter out malformed entries (non-dict)
-    data["entries"] = [e for e in data["entries"] if isinstance(e, dict)]
-    data.setdefault("version", "1")
-    return data
-
-
-def _write_vault(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+from vault_io import read_vault, write_vault
 
 
 def _find_active(vault: dict, task_id: str) -> dict | None:
@@ -166,6 +142,9 @@ def _build_entry(payload: dict, vault: dict, prompts_dir: Path, version_of: str 
         "task_type": str(payload.get("task_type", "")).strip(),
         "quality_score": int(payload.get("quality_score", 0)) or 0,
         "overlay_used": _list_field(payload, "overlay_used"),
+        "loop_lineage": payload.get("loop_lineage", []),
+        "loop_objective": payload.get("loop_objective"),
+        "loop_id": str(payload.get("loop_id", "")).strip(),
     }
 
     # Store LLM-generated summary if present
@@ -227,7 +206,7 @@ def main() -> None:
             print(json.dumps({"status": "error", "message": "No valid JSON objects in batch input."}))
             sys.exit(1)
 
-        vault = _read_vault(args.vault)
+        vault = read_vault(args.vault)
         saved = 0
         errors = 0
         for payload in payloads:
@@ -240,7 +219,7 @@ def main() -> None:
             except ValueError:
                 errors += 1
 
-        _write_vault(args.vault, vault)
+        write_vault(args.vault, vault)
         print(json.dumps({
             "status": "saved",
             "batch": True,
@@ -265,14 +244,14 @@ def main() -> None:
         print(json.dumps({"status": "error", "message": "Input must be a JSON object."}))
         sys.exit(1)
 
-    vault = _read_vault(args.vault)
+    vault = read_vault(args.vault)
     try:
         entry = _build_entry(payload, vault, args.prompts_dir, args.version_of)
     except ValueError as exc:
         print(json.dumps({"status": "error", "message": str(exc)}))
         sys.exit(1)
 
-    _write_vault(args.vault, vault)
+    write_vault(args.vault, vault)
     result = {
         "status": "saved",
         "id": entry["id"],

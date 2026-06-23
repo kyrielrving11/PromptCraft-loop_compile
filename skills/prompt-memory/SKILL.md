@@ -5,7 +5,7 @@ description: >
   checkpoint.py (save prompt contexts to .promptcraft/prompt_vault.json with
   Git-style immutable version log) and hydrate.py (semantic search with
   keyword overlap scoring, version rollback, and version history listing).
-  Use when the PromptCraft engine (promptcraft-agent/engine.py) or other tools
+  Use when the PromptCraft engine (loop-compiler/engine.py) or other tools
   need to persist or load prompt history. ALL persistence is file-based — no
   host memory API, no database.
 ---
@@ -102,7 +102,7 @@ python hydrate.py --query "audit contract" --no-global
 
 ## When to Use This Skill
 
-Load `prompt-memory` alongside `promptcraft-agent/engine.py`. The scripts are
+Load `prompt-memory` alongside `loop-compiler/engine.py`. The scripts are
 deterministic — execute them directly rather than loading them into the AI's context.
 
 ## Reference
